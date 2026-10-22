@@ -25,6 +25,13 @@ final class Module {
         'client_id'=>'','client_secret'=>'','folder_id'=>'','auto_sync'=>'1'
     ]); }
     private function tokens() { return get_option($this->token_option, []); }
+    /** Accepts a bare folder ID or a full Google Drive folder URL and returns just the ID. */
+    private static function extract_folder_id($value) {
+        $value=trim(sanitize_text_field($value));
+        if (preg_match('~/folders/([A-Za-z0-9_-]+)~', $value, $m)) return $m[1];
+        if (preg_match('~[?&]id=([A-Za-z0-9_-]+)~', $value, $m)) return $m[1];
+        return preg_replace('~[^A-Za-z0-9_-]~', '', $value);
+    }
     public function admin_menu() {
         add_submenu_page('options-general.php', 'MasCamp DocSync', 'MasCamp DocSync', 'manage_options', 'mascamp-docsync', [$this,'settings_page']);
     }
@@ -36,7 +43,7 @@ final class Module {
                     'client_id'=>sanitize_text_field($v['client_id'] ?? ''),
                     // Keep secrets only if a value was submitted. Prefer server environment constants for production.
                     'client_secret'=>sanitize_text_field($v['client_secret'] ?? $old['client_secret']),
-                    'folder_id'=>sanitize_text_field($v['folder_id'] ?? ''),
+                    'folder_id'=>self::extract_folder_id($v['folder_id'] ?? ''),
                     'auto_sync'=>!empty($v['auto_sync']) ? '1':'0'
                 ];
             }
@@ -48,11 +55,12 @@ final class Module {
         $connected=!empty($t['refresh_token']) || !empty($t['access_token']);
         echo '<div class="wrap"><h1>MasCamp DocSync</h1>';
         echo '<p>Sync published WordPress posts and pages to one Google Drive folder. Configure OAuth in Google Cloud Console first.</p>';
+        echo '<p><strong>Authorized redirect URI</strong> (paste into your Google OAuth client):<br><input type="text" class="large-text code" readonly onclick="this.select()" value="'.esc_attr($this->redirect_uri()).'"></p>';
         echo '<form method="post" action="options.php">';
         settings_fields('mascamp_docsync');
         echo '<table class="form-table"><tr><th>OAuth Client ID</th><td><input class="regular-text" name="'.esc_attr($this->option).'[client_id]" value="'.esc_attr($s['client_id']).'"></td></tr>';
         echo '<tr><th>OAuth Client Secret</th><td><input type="password" autocomplete="new-password" class="regular-text" name="'.esc_attr($this->option).'[client_secret]" value="" placeholder="'.($s['client_secret']?'Saved — leave blank to keep':'Paste client secret').'"><p class="description">Stored in the WordPress options table. For hardened deployments, define MASCAMP_GDOCS_CLIENT_SECRET in wp-config.php instead.</p></td></tr>';
-        echo '<tr><th>Google Drive folder ID</th><td><input class="regular-text" name="'.esc_attr($this->option).'[folder_id]" value="'.esc_attr($s['folder_id']).'"><p class="description">Copy the folder ID from its Google Drive URL. The OAuth account must have access.</p></td></tr>';
+        echo '<tr><th>Google Drive folder ID</th><td><input class="regular-text" name="'.esc_attr($this->option).'[folder_id]" value="'.esc_attr($s['folder_id']).'"><p class="description">Paste the folder ID or the full Google Drive folder URL; the ID is extracted on save. The OAuth account must have access.</p></td></tr>';
         echo '<tr><th>Automatic sync</th><td><label><input type="checkbox" name="'.esc_attr($this->option).'[auto_sync]" value="1" '.checked($s['auto_sync'],'1',false).'> Queue sync when a published post/page is updated</label></td></tr></table>';
         submit_button('Save Settings'); echo '</form>';
         echo '<hr><h2>Google authorization</h2>';
@@ -74,7 +82,7 @@ final class Module {
         set_transient('mascamp_gdocs_oauth_state_'.get_current_user_id(), $state, 10*MINUTE_IN_SECONDS);
         $url=add_query_arg([
             'client_id'=>$s['client_id'],'redirect_uri'=>$this->redirect_uri(),'response_type'=>'code',
-            'scope'=>'https://www.googleapis.com/auth/documents https://www.googleapis.com/auth/drive.file',
+            'scope'=>'https://www.googleapis.com/auth/documents https://www.googleapis.com/auth/drive',
             'access_type'=>'offline','prompt'=>'consent','include_granted_scopes'=>'true','state'=>$state
         ],'https://accounts.google.com/o/oauth2/v2/auth');
         wp_redirect($url); exit;

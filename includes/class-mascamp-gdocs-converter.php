@@ -13,7 +13,7 @@ if (!defined('ABSPATH')) exit;
  * links, bulleted and numbered lists, images (with figcaptions), simple tables (cells tab-separated).
  */
 final class Converter {
-    private static $skip   = ['script', 'style', 'noscript', 'iframe', 'svg', 'form', 'button', 'input', 'select', 'textarea', 'video', 'audio', 'object', 'embed', 'template', 'head'];
+    public static $skip    = ['script', 'style', 'noscript', 'iframe', 'svg', 'form', 'button', 'input', 'select', 'textarea', 'video', 'audio', 'object', 'embed', 'template', 'head'];
     private static $blocks = ['p', 'div', 'section', 'article', 'header', 'footer', 'main', 'aside', 'nav', 'figure', 'blockquote', 'pre', 'address', 'table', 'thead', 'tbody', 'tfoot', 'tr', 'dl', 'dt', 'dd', 'center'];
     const MAX_IMAGE_PT = 468; // 6.5in usable page width
 
@@ -21,20 +21,21 @@ final class Converter {
     private $paras = [];
     /** @var array|null paragraph being built */
     private $current = null;
+    /** @var bool insert images as links instead of embedding them */
+    private $link_images = false;
 
-    public static function convert($title, $html, $source_url, $featured_url = '') {
+    /**
+     * @param array $opts ['images' => 'embed'|'link']
+     */
+    public static function convert($title, $html, $source_url, $featured_url = '', array $opts = []) {
         $c = new self();
+        $c->link_images = ($opts['images'] ?? 'embed') === 'link';
         $c->paras[] = ['runs' => [self::run($title, [])], 'type' => 'TITLE', 'list' => null];
         $c->paras[] = ['runs' => [self::run('Source: ', ['italic' => true]), self::run($source_url, ['italic' => true, 'link' => $source_url])], 'type' => 'NORMAL_TEXT', 'list' => null];
-        if ($featured_url && ($u = self::absolute_url($featured_url))) $c->paras[] = ['image' => $u, 'width' => self::MAX_IMAGE_PT];
+        if ($featured_url && ($u = self::absolute_url($featured_url))) $c->add_image($u, self::MAX_IMAGE_PT, 'Featured image');
 
         if (class_exists('\DOMDocument') && trim($html) !== '') {
-            $dom = new \DOMDocument('1.0', 'UTF-8');
-            $prev = libxml_use_internal_errors(true);
-            $dom->loadHTML('<?xml encoding="utf-8" ?><div id="mc-root">' . $html . '</div>', LIBXML_HTML_NOIMPLIED | LIBXML_HTML_NODEFDTD);
-            libxml_clear_errors();
-            libxml_use_internal_errors($prev);
-            $root = (new \DOMXPath($dom))->query('//div[@id="mc-root"]')->item(0);
+            $root = self::load_html($html);
             if ($root) $c->walk($root, []);
             $c->flush();
         } elseif (trim($html) !== '') {
@@ -45,6 +46,23 @@ final class Converter {
             }
         }
         return $c->build();
+    }
+
+    /** Parses an HTML fragment and returns its wrapper element (or null). Shared with the Markdown converter. */
+    public static function load_html($html) {
+        $dom = new \DOMDocument('1.0', 'UTF-8');
+        $prev = libxml_use_internal_errors(true);
+        $dom->loadHTML('<?xml encoding="utf-8" ?><div id="mc-root">' . $html . '</div>', LIBXML_HTML_NOIMPLIED | LIBXML_HTML_NODEFDTD);
+        libxml_clear_errors();
+        libxml_use_internal_errors($prev);
+        return (new \DOMXPath($dom))->query('//div[@id="mc-root"]')->item(0);
+    }
+
+    /** Best image URL for an <img>, handling lazy-load attributes. Shared with the Markdown converter. */
+    public static function image_src(\DOMElement $el) {
+        $src = $el->getAttribute('src');
+        if (!$src || strpos($src, 'data:') === 0) $src = $el->getAttribute('data-lazy-src') ?: $el->getAttribute('data-src');
+        return self::absolute_url($src);
     }
 
     /** Length in UTF-16 code units (Google Docs index units). */
@@ -131,14 +149,19 @@ final class Converter {
     }
 
     private function image(\DOMElement $el) {
-        $src = $el->getAttribute('src');
-        if (!$src || strpos($src, 'data:') === 0) $src = $el->getAttribute('data-lazy-src') ?: $el->getAttribute('data-src');
-        $url = self::absolute_url($src);
+        $url = self::image_src($el);
         if (!$url) return;
         $this->flush();
         $w = (int) $el->getAttribute('width');
         $pt = $w > 0 ? min(self::MAX_IMAGE_PT, max(24, (int) round($w * 0.75))) : self::MAX_IMAGE_PT;
-        $this->paras[] = ['image' => $url, 'width' => $pt];
+        $this->add_image($url, $pt, trim($el->getAttribute('alt')));
+    }
+
+    /** Embeds the image, or (link mode) adds a linked "Image: …" line pointing at its URL. */
+    private function add_image($url, $pt, $alt = '') {
+        if (!$this->link_images) { $this->paras[] = ['image' => $url, 'width' => $pt]; return; }
+        $name = $alt !== '' ? $alt : rawurldecode(basename((string) parse_url($url, PHP_URL_PATH)));
+        $this->paras[] = ['runs' => [self::run('Image: ', ['italic' => true]), self::run($name ?: $url, ['italic' => true, 'link' => $url])], 'type' => 'NORMAL_TEXT', 'list' => null];
     }
 
     private function flush() {
@@ -206,7 +229,7 @@ final class Converter {
         'screen-reader-text', 'sr-only', 'elementor-screen-only', 'elementor-hidden-desktop',
         'elementor-tab-desktop-title', 'swiper-slide-duplicate', 'slick-cloned',
     ];
-    private static function hidden(\DOMElement $el) {
+    public static function hidden(\DOMElement $el) {
         $style = strtolower(str_replace(' ', '', $el->getAttribute('style')));
         if (strpos($style, 'display:none') !== false || $el->hasAttribute('hidden')) return true;
         $class = ' ' . $el->getAttribute('class') . ' ';
@@ -223,7 +246,7 @@ final class Converter {
         return $a['bold'] === $b['bold'] && $a['italic'] === $b['italic'] && $a['underline'] === $b['underline'] && $a['link'] === $b['link'];
     }
 
-    private static function absolute_url($url) {
+    public static function absolute_url($url) {
         $url = trim(html_entity_decode((string) $url, ENT_QUOTES | ENT_HTML5, 'UTF-8'));
         if ($url === '' || $url[0] === '#') return '';
         if (strpos($url, '//') === 0) $url = 'https:' . $url;

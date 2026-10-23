@@ -1,49 +1,65 @@
 # MasCamp DocSync
 
-A standalone WordPress plugin. It syncs chosen, published WordPress posts and pages into a single designated Google Drive folder, updates the same linked Google Doc on later syncs, and records sync status on the post.
+A standalone WordPress plugin that syncs chosen, published posts and pages to **Google Docs** and/or a **Git repository** (GitHub, GitLab, Bitbucket Cloud or Gitea). The sync is one-way: WordPress is the source of truth.
+
+Install it in `wp-content/plugins/mascamp-docsync/` and activate **MasCamp DocSync**. Everything is configured under **Settings → MasCamp DocSync**, which has these tabs: *Google Docs*, *Git*, *Sync all* and *How it works*.
 
 ## Files
-- `mascamp-docsync.php` — plugin entry point
-- `includes/class-mascamp-gdocs-sync.php` — admin settings, OAuth, API calls, scheduling, status/metabox
-- `includes/class-mascamp-gdocs-converter.php` — basic HTML conversion
-
-## Google Cloud setup
-1. Create/select a project in Google Cloud Console.
-2. Enable **Google Docs API** and **Google Drive API**.
-3. Configure the OAuth consent screen. Either publish the app (recommended: Testing-mode connections expire after 7 days) or add the Google account as a test user.
-4. Create an OAuth client ID of type **Web application**.
-5. Add the Authorized redirect URI shown at the top of **Settings → MasCamp DocSync**, for example:
-   `https://YOUR-SITE.example/wp-admin/admin-post.php?action=mascamp_gdocs_callback`
-6. In WordPress, open **Settings → MasCamp DocSync**. Enter client ID, client secret and the destination Drive folder (ID or full URL), save, then connect the Google account.
-7. The connected Google account needs editor access to the destination folder.
-
-## Recommended secret storage
-Instead of storing the client secret in WordPress options, define this in `wp-config.php`:
-```php
-define('MASCAMP_GDOCS_CLIENT_SECRET', 'your-client-secret');
-```
-Then leave the client-secret field blank. Keep `wp-config.php` out of source control.
+- `mascamp-docsync.php`: plugin entry point
+- `includes/class-mascamp-docsync.php`: core (settings page, editor box, Posts/Pages column, row and bulk actions, Sync all, queueing)
+- `includes/class-mascamp-docsync-destination.php`: base class shared by the destinations
+- `includes/class-mascamp-gdocs-destination.php`: Google Docs (OAuth, Drive/Docs API)
+- `includes/class-mascamp-gdocs-converter.php`: HTML → Google Docs formatting
+- `includes/class-mascamp-git-destination.php`: Git settings and the Markdown file builder
+- `includes/class-mascamp-git-client.php`: GitHub, GitLab, Bitbucket and Gitea REST clients
+- `includes/class-mascamp-markdown-converter.php`: HTML → Markdown
 
 ## Choosing what syncs
-Nothing syncs unless you choose it.
-- **One post, once:** open the post or page and click **Sync to Google Docs now** in the *Google Docs Sync* box, or hover it in **Posts/Pages** and click **Sync to Google Docs**. The sync runs immediately and shows a link to the doc.
-- **Everything:** in **Settings → MasCamp DocSync → Sync all**, click **Sync all posts** or **Sync all pages**. Tick *Only ones without a doc yet* to skip items already synced. It runs one item at a time with a progress bar and a Cancel button. Keep the page open to finish faster; if you close it, WP-Cron carries on in the background. If Google's rate limit is hit, it pauses for a minute and retries.
-- **Several posts:** tick them in **Posts/Pages**, choose **Sync to Google Docs** from *Bulk actions*, and click **Apply**. They're queued through WP-Cron, a few seconds apart.
-- **Keep a post updated:** tick **Keep synced** in its *Google Docs Sync* box, or use the **Google Docs: keep synced** bulk action. After that, every time it's updated, the linked doc is refreshed automatically. Use **Google Docs: stop keeping synced** to turn this off.
-- The **Automatic sync** setting pauses or resumes all *Keep synced* updates site-wide.
-- The **Google Doc** column in Posts/Pages shows each item's status, a link to its doc, and whether it's set to keep synced.
+Nothing syncs unless you choose it. Google Docs and Git are chosen separately for each post.
+- **One post:** in the post editor's *DocSync* box, click **Sync to Google Docs now** or **Sync to Git now**. You can also hover the post in **Posts/Pages** and use the row link.
+- **Everything:** on the **Sync all** tab, choose **Sync all posts** or **Sync all pages** for a destination. Tick *Only ones not synced yet* to skip items already synced. Items are processed one at a time, with a progress bar and a Cancel button. Keeping the page open makes it finish faster; if you close it, WP-Cron carries on in the background. If a rate limit is hit, it pauses for a minute and then retries.
+- **Several posts:** tick them in **Posts/Pages**, choose a sync from *Bulk actions*, and click **Apply**.
+- **Keep a post updated:** tick **Keep synced** under Google Docs or Git in the post's *DocSync* box, or use the *keep synced* bulk action. Each destination has an **Automatic sync** setting that pauses or resumes this for the whole site.
+- The **DocSync** column in Posts/Pages shows each item's status for each destination, with a link to the synced copy.
 
-## Behaviour
-- Each post or page is linked to one Google Doc (`_mascamp_gdocs_document_id`). Syncing again replaces that doc's contents, so no duplicates are created. If the title changes, the doc is renamed.
-- If the linked doc is deleted or trashed in Drive, the next sync creates a new doc automatically.
-- Only published posts and pages sync. The sync copies the last *saved* version.
-- The doc contains the title, a source link, the featured image, then the content: paragraphs, headings, bold, italic, underline, links, bulleted and numbered lists, images with captions, and simple tables with tab-separated cells.
-- Images: Google fetches each image from its URL. Public JPG, PNG and GIF images work. If Google can't fetch an image (WebP, a protected or localhost URL, hotlink protection), it's replaced by a link, the sync still completes, and a warning is shown on the post.
-- Automatic and bulk syncs run through WP-Cron, which needs site traffic or a real server cron calling `wp-cron.php`.
+## Google Docs
+### Setup
+1. In Google Cloud Console, enable the **Google Docs API** and the **Google Drive API**.
+2. Configure the OAuth consent screen. Publishing the app is recommended, because connections made in Testing mode expire after 7 days. Alternatively, add your Google account as a test user.
+3. Create an OAuth client of type **Web application**, and add the redirect URI shown on the *Google Docs* tab.
+4. Enter the Client ID, the Client Secret and the Drive folder (its ID or full URL), save, then click **Connect Google account**.
 
-## Limitations
-- One-way only (WordPress → Google Docs). Edits made in the Google Doc are overwritten on the next sync.
-- Page-builder layouts (columns, sliders, tabs) come through as plain stacked content. Nested lists are flattened, and complex tables become tab-separated lines.
-- Google OAuth tokens are stored in the WordPress options table.
-## Standalone plugin installation
-Install this as its own plugin in `wp-content/plugins/mascamp-docsync/`, then activate **MasCamp DocSync** in WordPress. It does not need to be included in `mascamp-plugin`.
+### Behaviour
+- Each post is linked to one Google Doc. Syncing again replaces that doc's contents: edits made in the doc are overwritten, but they stay in the doc's Version history. If the post's title changes, the doc is renamed. If the doc is deleted or trashed, the next sync creates a new one.
+- **Images:** the default *Show images in the doc* embeds each image inside the doc; Google fetches it from its URL. *Link to images only* adds an "Image: …" link to the website URL instead. Neither option adds image files to your Drive folder. If an image can't be fetched (for example WebP, a protected URL or localhost), it becomes a link and a warning is recorded on the post.
+
+## Git
+### Setup
+On the *Git* tab, fill in:
+- **Provider Type:** GitHub, GitLab, Bitbucket or Gitea.
+- **Repository URL:** the browser address or the clone URL, e.g. `https://github.com/owner/repo`. Gitea needs the full URL of your server. Only Bitbucket Cloud is supported.
+- **Branch:** usually `main`.
+- **Folder in repository:** default `wordpress-content`.
+- **Access Token:** a token is always needed to push, whether the repository is public or private.
+  - **GitHub:** a fine-grained token limited to this repo, with **Contents: Read and write**.
+  - **GitLab:** a project or personal access token with the **api** scope.
+  - **Bitbucket:** a repository access token with **Repositories: Write**. Leave *Username* blank. If you use an Atlassian API token instead, enter your account email as *Username*.
+  - **Gitea:** a token with **repository: Read and Write**.
+
+Then click **Test connection**. To keep the token out of the database, define it in `wp-config.php`:
+```php
+define('MASCAMP_DOCSYNC_GIT_TOKEN', 'your-token');
+```
+
+### What gets committed
+- Posts are saved as `wordpress-content/posts/<slug>.md` and pages as `wordpress-content/pages/<slug>.md`. A post keeps its first file path even if its slug changes later, so its history stays in one file.
+- Each file starts with YAML front matter (title, id, type, slug, date, modified, author, permalink, categories, tags and featured_image), followed by the content converted to Markdown.
+- Each changed item is one commit, with a message such as `Update post: Band Launch 2027`. If nothing changed, no commit is made and the status shows *Up to date*.
+- **Images are referenced by their website URL only.** Image files are never copied into the repository.
+
+## Notes and limitations
+- Elementor pages are synced from their rendered content. Page-builder layout (columns, spacing, backgrounds) is not kept: content comes through stacked in page order.
+- Only published posts and pages sync, and each sync copies the last *saved* version.
+- Automatic, bulk and background syncs use WP-Cron, which needs site traffic or a real server cron calling `wp-cron.php`.
+- Google OAuth tokens and the Git token, unless it's defined in wp-config.php, are stored in the WordPress options table.
+- Sync is one-way. Changes made in Google Docs or in the repository never come back into WordPress, and they are overwritten on the next sync.

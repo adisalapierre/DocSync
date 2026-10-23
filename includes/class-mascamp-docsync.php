@@ -338,13 +338,15 @@ final class Module {
             echo '<p><strong>Syncing all ' . esc_html(self::type_label($b['type'])) . ' to ' . esc_html($d ? $d->label() : '') . ':</strong> <span id="mcds-count">' . $done . ' of ' . $total . '</span> · <span id="mcds-errors">' . (int) $b['errors'] . '</span> error(s)</p>';
             echo '<div style="background:#dcdcde;border-radius:4px;height:14px;overflow:hidden"><div id="mcds-bar" style="background:#2271b1;height:14px;width:' . $pct . '%;transition:width .4s"></div></div>';
             echo '<p class="description" id="mcds-note">Keep this page open to finish faster. If you close it, syncing continues in the background, more slowly.</p>';
+            echo '<p id="mcds-last-error" style="color:#b32d2e' . (empty($b['failures']) ? ';display:none' : '') . '">Latest error: <span>' . esc_html(empty($b['failures']) ? '' : end($b['failures'])['error']) . '</span></p>';
             echo '<form method="post" action="' . esc_url(admin_url('admin-post.php')) . '"><input type="hidden" name="action" value="mascamp_docsync_batch_cancel">';
             wp_nonce_field('mascamp_docsync_batch_cancel');
             submit_button('Cancel', 'secondary', 'submit', false);
             echo '</form></div>';
+            $this->render_failures($b);
             $ajax = esc_url_raw(admin_url('admin-ajax.php'));
             $nonce = wp_create_nonce('mascamp_docsync_batch_step');
-            echo "<script>(function(){var busy=false,fails=0;function step(){if(busy)return;busy=true;var f=new FormData();f.append('action','mascamp_docsync_batch_step');f.append('_ajax_nonce'," . wp_json_encode($nonce) . ");fetch(" . wp_json_encode($ajax) . ",{method:'POST',body:f,credentials:'same-origin'}).then(function(r){return r.json();}).then(function(r){busy=false;fails=0;if(!r||!r.success){return setTimeout(step,5000);}var d=r.data;document.getElementById('mcds-count').textContent=d.done+' of '+d.total;document.getElementById('mcds-errors').textContent=d.errors;document.getElementById('mcds-bar').style.width=(d.total?Math.floor(d.done*100/d.total):100)+'%';if(d.wait){document.getElementById('mcds-note').textContent='Rate limit reached. Pausing for a minute, then continuing automatically.';}if(d.finished){location.reload();return;}setTimeout(step,d.wait?d.wait*1000:1200);}).catch(function(){busy=false;if(++fails<20)setTimeout(step,5000);});}setTimeout(step,500);})();</script>";
+            echo "<script>(function(){var busy=false,fails=0;function step(){if(busy)return;busy=true;var f=new FormData();f.append('action','mascamp_docsync_batch_step');f.append('_ajax_nonce'," . wp_json_encode($nonce) . ");fetch(" . wp_json_encode($ajax) . ",{method:'POST',body:f,credentials:'same-origin'}).then(function(r){return r.json();}).then(function(r){busy=false;fails=0;if(!r||!r.success){return setTimeout(step,5000);}var d=r.data;document.getElementById('mcds-count').textContent=d.done+' of '+d.total;document.getElementById('mcds-errors').textContent=d.errors;document.getElementById('mcds-bar').style.width=(d.total?Math.floor(d.done*100/d.total):100)+'%';if(d.wait){document.getElementById('mcds-note').textContent='Rate limit reached. Pausing for a minute, then continuing automatically.';}if(d.last_error){var le=document.getElementById('mcds-last-error');le.style.display='';le.querySelector('span').textContent=d.last_error;}if(d.finished){location.reload();return;}setTimeout(step,d.wait?d.wait*1000:1200);}).catch(function(){busy=false;if(++fails<20)setTimeout(step,5000);});}setTimeout(step,500);})();</script>";
             return;
         }
         if (!empty($b['finished'])) {
@@ -352,7 +354,14 @@ final class Module {
             $msg = sprintf('Last run (%s): %d of %d %s synced', $d ? $d->label() : '', (int) $b['done'] - (int) $b['errors'], (int) $b['total'], self::type_label($b['type']));
             $msg .= (int) $b['errors'] ? sprintf(', %d error(s). The DocSync column in %s shows which ones and why.', (int) $b['errors'], ucfirst(self::type_label($b['type']))) : '.';
             if (!empty($b['cancelled'])) $msg .= ' (Cancelled.)';
-            echo '<div class="notice notice-info inline"><p>' . esc_html($msg) . ' <small>' . esc_html(wp_date(get_option('date_format') . ' ' . get_option('time_format'), (int) $b['finished'])) . '</small></p></div>';
+            if (!empty($b['stopped'])) {
+                echo '<div class="notice notice-error inline"><p><strong>Sync all stopped:</strong> the first ' . (int) $b['done'] . ' items all failed with the same error, so the rest were not attempted. Fix this, then run it again:</p><p><code>' . esc_html($b['stopped']) . '</code></p>';
+                if (($b['dest'] ?? '') === 'git') echo '<p>Use <a href="' . esc_url($this->settings_url('git')) . '">Git → Test connection</a> to check the fix before re-running.</p>';
+                echo '</div>';
+            } else {
+                echo '<div class="notice ' . ((int) $b['errors'] ? 'notice-warning' : 'notice-info') . ' inline"><p>' . esc_html($msg) . ' <small>' . esc_html(wp_date(get_option('date_format') . ' ' . get_option('time_format'), (int) $b['finished'])) . '</small></p></div>';
+            }
+            $this->render_failures($b);
         }
         $ready = $this->ready_dests();
         if (!$ready) {
@@ -377,6 +386,23 @@ final class Module {
             echo '</tbody></table>';
         }
         echo '<p class="description">Google Docs: existing linked docs are overwritten with the current WordPress version (earlier versions stay in each doc\'s Version history). Git: one commit per changed post; unchanged posts are skipped.</p>';
+    }
+
+    /** Table of failed items from the current/last Sync all, grouped by error message. */
+    private function render_failures($b) {
+        $fails = (array) ($b['failures'] ?? []);
+        if (!$fails) return;
+        $groups = [];
+        foreach ($fails as $f) $groups[$f['error']][] = $f;
+        echo '<details open style="max-width:900px;margin-top:12px"><summary style="cursor:pointer;font-weight:600">Errors (' . count($fails) . ')</summary>';
+        foreach ($groups as $error => $items) {
+            echo '<div style="background:#fff;border-left:4px solid #d63638;padding:8px 12px;margin:8px 0"><p style="margin:0 0 6px"><strong>' . esc_html($error) . '</strong> <small>(' . count($items) . ' item' . (count($items) === 1 ? '' : 's') . ')</small></p><p style="margin:0;font-size:12px">';
+            $links = [];
+            foreach (array_slice($items, 0, 25) as $f) $links[] = '<a href="' . esc_url(get_edit_post_link($f['id'], 'url')) . '">' . esc_html($f['title']) . '</a>';
+            echo implode(' · ', $links) . (count($items) > 25 ? ' · and ' . (count($items) - 25) . ' more' : '');
+            echo '</p></div>';
+        }
+        echo '</details>';
     }
 
     public function batch_start() {
@@ -421,7 +447,8 @@ final class Module {
         check_ajax_referer('mascamp_docsync_batch_step');
         $wait = $this->batch_process(1, 50);
         $b = $this->batch();
-        wp_send_json_success(['done' => (int) ($b['done'] ?? 0), 'total' => (int) ($b['total'] ?? 0), 'errors' => (int) ($b['errors'] ?? 0), 'finished' => !$this->batch_running(), 'wait' => $wait]);
+        $last = empty($b['failures']) ? '' : end($b['failures'])['error'];
+        wp_send_json_success(['done' => (int) ($b['done'] ?? 0), 'total' => (int) ($b['total'] ?? 0), 'errors' => (int) ($b['errors'] ?? 0), 'finished' => !$this->batch_running(), 'wait' => $wait, 'last_error' => $last]);
     }
 
     /** Background step via WP-Cron: a few items, then reschedule itself. */
@@ -476,7 +503,20 @@ final class Module {
                 break;
             }
             $b['done'] = (int) $b['done'] + 1;
-            if ($result !== true) $b['errors'] = (int) $b['errors'] + 1;
+            if ($result !== true) {
+                $b['errors'] = (int) $b['errors'] + 1;
+                $b['failures'] = array_slice(array_merge((array) ($b['failures'] ?? []), [[
+                    'id' => $id, 'title' => self::plain_title($id),
+                    'error' => is_wp_error($result) ? $result->get_error_message() : 'Unknown error',
+                ]]), -100);
+                // The first few all failed the same way: it's a setup problem, so stop instead of failing every post.
+                $msgs = array_unique(array_column($b['failures'], 'error'));
+                if ((int) $b['done'] >= 3 && (int) $b['errors'] === (int) $b['done'] && count($msgs) === 1) {
+                    $b['stopped'] = reset($msgs);
+                    foreach ((array) $b['ids'] as $rest) if ($d->meta($rest, 'status') === 'Queued') $d->del_meta($rest, 'status');
+                    $b['ids'] = [];
+                }
+            }
             if (empty($b['ids'])) $b['finished'] = time();
             update_option(self::BATCH_OPTION, $b, false);
             $n++;

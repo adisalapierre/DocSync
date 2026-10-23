@@ -2,13 +2,13 @@
 /**
  * Plugin Name: MasCamp DocSync
  * Description: Sync chosen WordPress posts and pages to Google Docs and/or a Git repository (GitHub, GitLab, Bitbucket, Gitea), with per-post Keep synced, bulk actions, Sync all and sync status.
- * Version: 0.2.0
+ * Version: 0.2.1
  * Author: MasCamp
  * Requires PHP: 7.4
  */
 if (!defined('ABSPATH')) exit;
 
-define('MASCAMP_DOCSYNC_VERSION', '0.2.0');
+define('MASCAMP_DOCSYNC_VERSION', '0.2.1');
 define('MASCAMP_DOCSYNC_DIR', plugin_dir_path(__FILE__));
 
 require_once MASCAMP_DOCSYNC_DIR . 'includes/class-mascamp-gdocs-converter.php';

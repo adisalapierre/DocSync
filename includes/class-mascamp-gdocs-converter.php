@@ -3,88 +3,215 @@ namespace MasCamp\GoogleDocsSync;
 if (!defined('ABSPATH')) exit;
 
 /**
- * Small, dependency-free HTML-to-Google-Docs request converter.
- * Preserves paragraphs, headings, bold/italic/underline, links and common lists.
- * Image URIs are inserted after text at calculated positions; unsupported HTML is reduced to readable text.
+ * Dependency-free HTML → Google Docs converter.
+ *
+ * Produces plain text plus index-based formatting instructions for the Docs API.
+ * All positions are in UTF-16 code units, which is how Google Docs counts characters
+ * (curly quotes, accents and emoji would otherwise shift formatting out of place).
+ *
+ * Handles: title, source link, featured image, paragraphs, headings h1–h6, bold/italic/underline,
+ * links, bulleted and numbered lists, images (with figcaptions), simple tables (cells tab-separated).
  */
 final class Converter {
-    public static function convert($title,$html,$source_url,$featured_url='') {
-        $blocks=[]; $images=[];
-        if ($featured_url) $blocks[]=['type'=>'image','url'=>esc_url_raw($featured_url)];
-        $blocks[]=['type'=>'heading','text'=>$title,'level'=>1];
-        $blocks[]=['type'=>'paragraph','text'=>'Source: '.$source_url,'link'=>$source_url];
-        if (class_exists('\DOMDocument')) {
-            $dom=new \DOMDocument('1.0','UTF-8');
-            $prev=libxml_use_internal_errors(true);
-            $dom->loadHTML('<?xml encoding="utf-8" ?><div id="mc-root">'.$html.'</div>',LIBXML_HTML_NOIMPLIED|LIBXML_HTML_NODEFDTD);
-            libxml_clear_errors(); libxml_use_internal_errors($prev);
-            $root=$dom->getElementById('mc-root');
-            if ($root) self::walk($root,$blocks);
-        } else {
-            $plain=wp_strip_all_tags(str_replace(['</p>','</div>','<br>','<br/>','<br />'],["\n\n","\n\n","\n","\n","\n"],$html));
-            foreach (preg_split('/\n{2,}/',trim($plain)) as $p) if (trim($p)!=='') $blocks[]=['type'=>'paragraph','text'=>trim($p)];
-        }
-        $text=''; $styles=[]; $paragraphs=[];
-        foreach ($blocks as $b) {
-            if ($b['type']==='image') {
-                // Placeholder paragraph is replaced by inline image using the same insertion index.
-                $text.="\n";
-                $images[]=['index'=>strlen($text)+1,'url'=>$b['url']];
-                continue;
+    private static $skip   = ['script', 'style', 'noscript', 'iframe', 'svg', 'form', 'button', 'input', 'select', 'textarea', 'video', 'audio', 'object', 'embed', 'template', 'head'];
+    private static $blocks = ['p', 'div', 'section', 'article', 'header', 'footer', 'main', 'aside', 'nav', 'figure', 'blockquote', 'pre', 'address', 'table', 'thead', 'tbody', 'tfoot', 'tr', 'dl', 'dt', 'dd', 'center'];
+    const MAX_IMAGE_PT = 468; // 6.5in usable page width
+
+    /** @var array[] finished paragraphs */
+    private $paras = [];
+    /** @var array|null paragraph being built */
+    private $current = null;
+
+    public static function convert($title, $html, $source_url, $featured_url = '') {
+        $c = new self();
+        $c->paras[] = ['runs' => [self::run($title, [])], 'type' => 'TITLE', 'list' => null];
+        $c->paras[] = ['runs' => [self::run('Source: ', ['italic' => true]), self::run($source_url, ['italic' => true, 'link' => $source_url])], 'type' => 'NORMAL_TEXT', 'list' => null];
+        if ($featured_url && ($u = self::absolute_url($featured_url))) $c->paras[] = ['image' => $u, 'width' => self::MAX_IMAGE_PT];
+
+        if (class_exists('\DOMDocument') && trim($html) !== '') {
+            $dom = new \DOMDocument('1.0', 'UTF-8');
+            $prev = libxml_use_internal_errors(true);
+            $dom->loadHTML('<?xml encoding="utf-8" ?><div id="mc-root">' . $html . '</div>', LIBXML_HTML_NOIMPLIED | LIBXML_HTML_NODEFDTD);
+            libxml_clear_errors();
+            libxml_use_internal_errors($prev);
+            $root = (new \DOMXPath($dom))->query('//div[@id="mc-root"]')->item(0);
+            if ($root) $c->walk($root, []);
+            $c->flush();
+        } elseif (trim($html) !== '') {
+            $plain = html_entity_decode(wp_strip_all_tags(preg_replace('~</(p|div|h[1-6]|li)>|<br\s*/?>~i', "\n\n", $html)), ENT_QUOTES | ENT_HTML5, 'UTF-8');
+            foreach (preg_split('/\n{2,}/', $plain) as $p) {
+                $p = trim(preg_replace('/\s+/u', ' ', $p));
+                if ($p !== '') $c->paras[] = ['runs' => [self::run($p, [])], 'type' => 'NORMAL_TEXT', 'list' => null];
             }
-            $start=1+mb_strlen($text,'UTF-8');
-            $line=$b['text'] ?? '';
-            $text.=$line."\n";
-            $end=1+mb_strlen($text,'UTF-8');
-            if ($b['type']==='heading') $paragraphs[]=['start'=>$start,'end'=>$end,'type'=>'HEADING_'.min(6,max(1,(int)($b['level'] ?? 1)))];
-            elseif ($b['type']==='list') $paragraphs[]=['start'=>$start,'end'=>$end,'type'=>'NORMAL_TEXT'];
-            if (!empty($b['bold']) || !empty($b['italic']) || !empty($b['underline'])) {
-                $style=[];
-                if (!empty($b['bold'])) $style['bold']=true;
-                if (!empty($b['italic'])) $style['italic']=true;
-                if (!empty($b['underline'])) $style['underline']=true;
-                $styles[]=['start'=>$start,'end'=>$end-1,'style'=>$style];
-            }
-            if (!empty($b['link'])) $styles[]=['start'=>$start,'end'=>$end-1,'style'=>['link'=>['url'=>$b['link']]]];
         }
-        return ['text'=>$text,'styles'=>$styles,'paragraphs'=>$paragraphs,'images'=>$images];
+        return $c->build();
     }
-    private static function walk($node,&$blocks,$state=[]) {
+
+    /** Length in UTF-16 code units (Google Docs index units). */
+    public static function u16len($s) {
+        if ($s === '') return 0;
+        $chars = preg_match_all('/./us', $s);
+        $astral = preg_match_all('/[\x{10000}-\x{10FFFF}]/u', $s);
+        return (int) $chars + (int) $astral;
+    }
+
+    /* ------------------------------------------------------------ DOM walk */
+
+    private function walk(\DOMNode $node, array $ctx) {
         foreach ($node->childNodes as $child) {
-            if ($child->nodeType===XML_TEXT_NODE) {
-                $t=preg_replace('/\s+/u',' ',trim($child->nodeValue));
-                if ($t!=='') {
-                    $last=count($blocks)-1;
-                    if ($last>=0 && in_array($blocks[$last]['type'],['paragraph','heading','list'],true)) {
-                        $blocks[$last]['text'].=($blocks[$last]['text']!==''?' ':'').$t;
-                        foreach (['bold','italic','underline','link'] as $k) if (!empty($state[$k])) $blocks[$last][$k]=$state[$k];
-                    } else $blocks[]=['type'=>'paragraph','text'=>$t]+$state;
-                }
+            if ($child->nodeType === XML_TEXT_NODE || $child->nodeType === XML_CDATA_SECTION_NODE) {
+                $this->text($child->nodeValue, $ctx);
                 continue;
             }
-            if ($child->nodeType!==XML_ELEMENT_NODE) continue;
-            $tag=strtolower($child->nodeName);
-            if ($tag==='img') {
-                $src=$child->getAttribute('src');
-                if ($src && wp_http_validate_url($src)) $blocks[]=['type'=>'image','url'=>esc_url_raw($src)];
-                $alt=trim($child->getAttribute('alt')); if ($alt) $blocks[]=['type'=>'paragraph','text'=>$alt];
+            if ($child->nodeType !== XML_ELEMENT_NODE) continue;
+            $tag = strtolower($child->nodeName);
+            if (in_array($tag, self::$skip, true)) continue;
+
+            if ($tag === 'br' || $tag === 'hr') { $this->flush(); continue; }
+            if ($tag === 'img') { $this->image($child); continue; }
+
+            $next = $ctx;
+            if (in_array($tag, ['strong', 'b', 'th'], true)) $next['bold'] = true;
+            if (in_array($tag, ['em', 'i', 'cite', 'figcaption'], true)) $next['italic'] = true;
+            if ($tag === 'u' || $tag === 'ins') $next['underline'] = true;
+            if ($tag === 'a') {
+                $href = self::absolute_url($child->getAttribute('href'));
+                if ($href) $next['link'] = $href;
+            }
+
+            if (preg_match('/^h([1-6])$/', $tag, $m)) {
+                $this->flush();
+                $next['heading'] = 'HEADING_' . $m[1];
+                $this->walk($child, $next);
+                $this->flush();
                 continue;
             }
-            if ($tag==='br') { $blocks[]=['type'=>'paragraph','text'=>'']; continue; }
-            $next=$state;
-            if (in_array($tag,['strong','b'],true)) $next['bold']=true;
-            if (in_array($tag,['em','i'],true)) $next['italic']=true;
-            if ($tag==='u') $next['underline']=true;
-            if ($tag==='a' && wp_http_validate_url($child->getAttribute('href'))) $next['link']=esc_url_raw($child->getAttribute('href'));
-            $isBlock=in_array($tag,['p','div','section','article','blockquote','li','h1','h2','h3','h4','h5','h6'],true);
-            $before=count($blocks);
-            self::walk($child,$blocks,$next);
-            if ($isBlock && count($blocks)===$before) $blocks[]=['type'=>'paragraph','text'=>''];
-            if ($isBlock && count($blocks)>$before) {
-                $idx=count($blocks)-1;
-                if (preg_match('/^h([1-6])$/',$tag,$m)) { $blocks[$idx]['type']='heading'; $blocks[$idx]['level']=(int)$m[1]; }
-                elseif ($tag==='li') $blocks[$idx]['type']='list';
+            if ($tag === 'ul' || $tag === 'ol') {
+                $this->flush();
+                $next['list'] = $tag === 'ol' ? 'NUMBERED' : 'BULLET';
+                $this->walk($child, $next);
+                $this->flush();
+                continue;
+            }
+            if ($tag === 'li') {
+                $this->flush();
+                $next['item'] = $ctx['list'] ?? 'BULLET';
+                $this->walk($child, $next);
+                $this->flush();
+                continue;
+            }
+            if ($tag === 'td' || $tag === 'th') {
+                $this->walk($child, $next);
+                $this->text("\t", ['raw' => true]);
+                continue;
+            }
+            if (in_array($tag, self::$blocks, true) || $tag === 'figcaption') {
+                $this->flush();
+                $this->walk($child, $next);
+                $this->flush();
+                continue;
+            }
+            $this->walk($child, $next); // inline element (span, a, strong, etc.)
+        }
+    }
+
+    private function text($value, array $ctx) {
+        $t = !empty($ctx['raw']) ? $value : preg_replace('/[\s\x{00A0}]+/u', ' ', $value);
+        $t = preg_replace('/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/u', '', (string) $t);
+        if ($t === '' || $t === null) return;
+        if ($this->current === null) {
+            if (trim($t) === '') return; // don't open a paragraph for stray whitespace
+            $this->current = ['runs' => [], 'type' => $ctx['heading'] ?? 'NORMAL_TEXT', 'list' => $ctx['item'] ?? null];
+        }
+        $run = self::run($t, $ctx);
+        $n = count($this->current['runs']);
+        if ($n && self::same_format($this->current['runs'][$n - 1], $run)) $this->current['runs'][$n - 1]['text'] .= $t;
+        else $this->current['runs'][] = $run;
+    }
+
+    private function image(\DOMElement $el) {
+        $src = $el->getAttribute('src');
+        if (!$src || strpos($src, 'data:') === 0) $src = $el->getAttribute('data-lazy-src') ?: $el->getAttribute('data-src');
+        $url = self::absolute_url($src);
+        if (!$url) return;
+        $this->flush();
+        $w = (int) $el->getAttribute('width');
+        $pt = $w > 0 ? min(self::MAX_IMAGE_PT, max(24, (int) round($w * 0.75))) : self::MAX_IMAGE_PT;
+        $this->paras[] = ['image' => $url, 'width' => $pt];
+    }
+
+    private function flush() {
+        if ($this->current === null) return;
+        $p = $this->current;
+        $this->current = null;
+        $runs = $p['runs'];
+        if (!$runs) return;
+        $runs[0]['text'] = ltrim($runs[0]['text']);
+        $last = count($runs) - 1;
+        $runs[$last]['text'] = rtrim($runs[$last]['text']);
+        $runs = array_values(array_filter($runs, static function ($r) { return $r['text'] !== ''; }));
+        if (!$runs || trim(implode('', array_column($runs, 'text'))) === '') return;
+        $p['runs'] = $runs;
+        $this->paras[] = $p;
+    }
+
+    /* ------------------------------------------------------------ Output */
+
+    private function build() {
+        $text = ''; $pos = 1;
+        $paragraphs = []; $styles = []; $images = []; $lists = [];
+        $open = null; // current list group
+
+        foreach ($this->paras as $p) {
+            if (isset($p['image'])) {
+                if ($open) { $lists[] = $open; $open = null; }
+                $images[] = ['index' => $pos, 'url' => $p['image'], 'width' => $p['width']];
+                $text .= "\n"; $pos += 1;
+                continue;
+            }
+            $start = $pos;
+            foreach ($p['runs'] as $r) {
+                $len = self::u16len($r['text']);
+                $style = [];
+                if (!empty($r['bold'])) $style['bold'] = true;
+                if (!empty($r['italic'])) $style['italic'] = true;
+                if (!empty($r['underline'])) $style['underline'] = true;
+                if (!empty($r['link'])) $style['link'] = ['url' => $r['link']];
+                if ($style && $len > 0) $styles[] = ['start' => $pos, 'end' => $pos + $len, 'style' => $style];
+                $text .= $r['text']; $pos += $len;
+            }
+            $text .= "\n"; $pos += 1;
+            $paragraphs[] = ['start' => $start, 'end' => $pos, 'type' => $p['type']];
+
+            $preset = $p['list'] === 'NUMBERED' ? 'NUMBERED_DECIMAL_ALPHA_ROMAN' : ($p['list'] ? 'BULLET_DISC_CIRCLE_SQUARE' : null);
+            if ($preset && $open && $open['preset'] === $preset) $open['end'] = $pos;
+            else {
+                if ($open) $lists[] = $open;
+                $open = $preset ? ['start' => $start, 'end' => $pos, 'preset' => $preset] : null;
             }
         }
+        if ($open) $lists[] = $open;
+
+        return ['text' => $text, 'end' => $pos, 'paragraphs' => $paragraphs, 'styles' => $styles, 'lists' => $lists, 'images' => $images];
+    }
+
+    /* ------------------------------------------------------------ Helpers */
+
+    private static function run($text, array $ctx) {
+        return ['text' => $text, 'bold' => !empty($ctx['bold']), 'italic' => !empty($ctx['italic']), 'underline' => !empty($ctx['underline']), 'link' => $ctx['link'] ?? null];
+    }
+
+    private static function same_format(array $a, array $b) {
+        return $a['bold'] === $b['bold'] && $a['italic'] === $b['italic'] && $a['underline'] === $b['underline'] && $a['link'] === $b['link'];
+    }
+
+    private static function absolute_url($url) {
+        $url = trim(html_entity_decode((string) $url, ENT_QUOTES | ENT_HTML5, 'UTF-8'));
+        if ($url === '' || $url[0] === '#') return '';
+        if (strpos($url, '//') === 0) $url = 'https:' . $url;
+        elseif ($url[0] === '/') $url = home_url($url);
+        if (!preg_match('~^https?://~i', $url)) return '';
+        $url = esc_url_raw($url);
+        return $url ?: '';
     }
 }

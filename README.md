@@ -27,6 +27,7 @@ Then leave the client-secret field blank. Keep `wp-config.php` out of source con
 ## Choosing what syncs
 Nothing syncs unless you choose it.
 - **One post, once:** open the post or page and click **Sync to Google Docs now** in the *Google Docs Sync* box, or hover it in **Posts/Pages** and click **Sync to Google Docs**. The sync runs immediately and shows a link to the doc.
+- **Everything:** in **Settings → MasCamp DocSync → Sync all**, click **Sync all posts** or **Sync all pages**. Tick *Only ones without a doc yet* to skip items already synced. It runs one item at a time with a progress bar and a Cancel button. Keep the page open to finish faster; if you close it, WP-Cron carries on in the background. If Google's rate limit is hit, it pauses for a minute and retries.
 - **Several posts:** tick them in **Posts/Pages**, choose **Sync to Google Docs** from *Bulk actions*, and click **Apply**. They're queued through WP-Cron, a few seconds apart.
 - **Keep a post updated:** tick **Keep synced** in its *Google Docs Sync* box, or use the **Google Docs: keep synced** bulk action. After that, every time it's updated, the linked doc is refreshed automatically. Use **Google Docs: stop keeping synced** to turn this off.
 - The **Automatic sync** setting pauses or resumes all *Keep synced* updates site-wide.

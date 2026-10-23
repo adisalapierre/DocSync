@@ -19,6 +19,9 @@ final class Module {
     const META_AUTO    = '_mascamp_docsync_auto';
     const META_SOURCE  = '_mascamp_gdocs_source_url';
     const CRON_HOOK    = 'mascamp_docsync_post';
+    const BATCH_HOOK   = 'mascamp_docsync_batch';
+    const BATCH_OPTION = 'mascamp_docsync_batch';
+    const BATCH_LOCK   = 'mascamp_docsync_batch_lock';
 
     private static $instance;
     private $option = 'mascamp_docsync_settings';
@@ -38,6 +41,10 @@ final class Module {
         add_action('save_post', [$this, 'queue_on_save'], 20, 2);
         add_action(self::CRON_HOOK, [$this, 'sync_post'], 10, 1);
         add_action('admin_notices', [$this, 'notices']);
+        add_action('admin_post_mascamp_docsync_batch_start', [$this, 'batch_start']);
+        add_action('admin_post_mascamp_docsync_batch_cancel', [$this, 'batch_cancel']);
+        add_action('wp_ajax_mascamp_docsync_batch_step', [$this, 'batch_ajax_step']);
+        add_action(self::BATCH_HOOK, [$this, 'batch_cron']);
         foreach (self::TYPES as $type) {
             add_filter("manage_{$type}_posts_columns", [$this, 'add_column']);
             add_action("manage_{$type}_posts_custom_column", [$this, 'render_column'], 10, 2);
@@ -116,8 +123,11 @@ final class Module {
             echo '<p>Authorize the Google account that owns or can edit the destination folder.</p><a class="button button-primary" href="' . esc_url(wp_nonce_url(admin_url('admin-post.php?action=mascamp_gdocs_connect'), 'mascamp_gdocs_connect')) . '">Connect Google account</a>';
         }
 
+        $this->render_batch_section($connected && $s['folder_id']);
+
         echo '<hr><h2>Choosing what syncs</h2><ul style="list-style:disc;padding-left:20px">';
         echo '<li><strong>One post:</strong> open it and click <em>Sync to Google Docs now</em> in the Google Docs Sync box, or hover it in Posts/Pages and click <em>Sync to Google Docs</em>.</li>';
+        echo '<li><strong>Everything:</strong> use <em>Sync all posts</em> or <em>Sync all pages</em> above.</li>';
         echo '<li><strong>Several posts:</strong> tick them in Posts/Pages, choose <em>Sync to Google Docs</em> from Bulk actions, and click Apply.</li>';
         echo '<li><strong>Keep a post updated:</strong> tick <em>Keep synced</em> in its Google Docs Sync box, or use the <em>Google Docs: keep synced</em> bulk action.</li>';
         echo '<li>Only published posts and pages can be synced. Each post has one linked Google Doc; syncing again replaces that doc\'s contents rather than creating a duplicate.</li>';
@@ -342,6 +352,160 @@ final class Module {
 
     public function sync_post($post_id) { $this->perform_sync(absint($post_id)); }
 
+    /* ---------------------------------------------------------------- Sync all (background batch) */
+
+    private function batch() { return get_option(self::BATCH_OPTION, []); }
+    private function batch_running() { $b = $this->batch(); return !empty($b['total']) && empty($b['finished']); }
+    private static function type_label($type, $plural = true) {
+        $o = get_post_type_object($type);
+        return $o ? strtolower($plural ? $o->labels->name : $o->labels->singular_name) : $type;
+    }
+
+    private function render_batch_section($ready) {
+        echo '<hr><h2>Sync all</h2>';
+        $b = $this->batch();
+        if ($this->batch_running()) {
+            $total = (int) $b['total']; $done = (int) $b['done'];
+            $pct = $total ? (int) floor($done * 100 / $total) : 0;
+            echo '<div id="mcds-batch" style="max-width:640px">';
+            echo '<p><strong>Syncing all ' . esc_html(self::type_label($b['type'])) . ':</strong> <span id="mcds-count">' . $done . ' of ' . $total . '</span> · <span id="mcds-errors">' . (int) $b['errors'] . '</span> error(s)</p>';
+            echo '<div style="background:#dcdcde;border-radius:4px;height:14px;overflow:hidden"><div id="mcds-bar" style="background:#2271b1;height:14px;width:' . $pct . '%;transition:width .4s"></div></div>';
+            echo '<p class="description" id="mcds-note">Keep this page open to finish faster. If you close it, syncing continues in the background, more slowly.</p>';
+            echo '<form method="post" action="' . esc_url(admin_url('admin-post.php')) . '"><input type="hidden" name="action" value="mascamp_docsync_batch_cancel">';
+            wp_nonce_field('mascamp_docsync_batch_cancel');
+            submit_button('Cancel', 'secondary', 'submit', false);
+            echo '</form></div>';
+            $ajax = esc_url_raw(admin_url('admin-ajax.php'));
+            $nonce = wp_create_nonce('mascamp_docsync_batch_step');
+            echo "<script>(function(){var busy=false,fails=0;function step(){if(busy)return;busy=true;var f=new FormData();f.append('action','mascamp_docsync_batch_step');f.append('_ajax_nonce'," . wp_json_encode($nonce) . ");fetch(" . wp_json_encode($ajax) . ",{method:'POST',body:f,credentials:'same-origin'}).then(function(r){return r.json();}).then(function(r){busy=false;fails=0;if(!r||!r.success){return setTimeout(step,5000);}var d=r.data;document.getElementById('mcds-count').textContent=d.done+' of '+d.total;document.getElementById('mcds-errors').textContent=d.errors;document.getElementById('mcds-bar').style.width=(d.total?Math.floor(d.done*100/d.total):100)+'%';if(d.wait){document.getElementById('mcds-note').textContent='Google rate limit reached. Pausing for a minute, then continuing automatically.';}if(d.finished){location.reload();return;}setTimeout(step,d.wait?d.wait*1000:1200);}).catch(function(){busy=false;if(++fails<20)setTimeout(step,5000);});}setTimeout(step,500);})();</script>";
+            return;
+        }
+        if (!empty($b['finished'])) {
+            $msg = sprintf('Last run: %d of %d %s synced', (int) $b['done'] - (int) $b['errors'], (int) $b['total'], self::type_label($b['type']));
+            $msg .= (int) $b['errors'] ? sprintf(', %d error(s). The Google Doc column in %s shows which ones and why.', (int) $b['errors'], ucfirst(self::type_label($b['type']))) : '.';
+            if (!empty($b['cancelled'])) $msg .= ' (Cancelled.)';
+            echo '<p>' . esc_html($msg) . ' <small>' . esc_html(wp_date(get_option('date_format') . ' ' . get_option('time_format'), (int) $b['finished'])) . '</small></p>';
+        }
+        if (!$ready) {
+            echo '<p class="description">Save a folder ID and connect a Google account to enable Sync all.</p>';
+            return;
+        }
+        echo '<p>Sync every published post or page in one go. It runs in the background, one item at a time, paced to stay within Google\'s limits.</p>';
+        echo '<table class="widefat striped" style="max-width:640px"><tbody>';
+        foreach (self::TYPES as $type) {
+            $published = (int) wp_count_posts($type)->publish;
+            $synced = count(get_posts(['post_type' => $type, 'post_status' => 'publish', 'fields' => 'ids', 'posts_per_page' => -1, 'no_found_rows' => true, 'meta_key' => self::META_DOC, 'meta_compare' => 'EXISTS']));
+            echo '<tr><td><strong>' . esc_html(ucfirst(self::type_label($type))) . '</strong><br><small>' . $published . ' published · ' . $synced . ' already have a Google Doc</small></td><td style="text-align:right">';
+            echo '<form method="post" action="' . esc_url(admin_url('admin-post.php')) . '" style="display:inline">';
+            echo '<input type="hidden" name="action" value="mascamp_docsync_batch_start"><input type="hidden" name="post_type" value="' . esc_attr($type) . '">';
+            wp_nonce_field('mascamp_docsync_batch_start');
+            echo '<label style="margin-right:10px"><input type="checkbox" name="only_new" value="1"> Only ones without a doc yet</label> ';
+            echo '<button type="submit" class="button button-primary"' . ($published ? '' : ' disabled') . ' onclick="return confirm(' . esc_attr(wp_json_encode('Sync all published ' . self::type_label($type) . ' to Google Docs? Existing linked docs will be overwritten with the WordPress version.')) . ')">Sync all ' . esc_html(self::type_label($type)) . '</button>';
+            echo '</form></td></tr>';
+        }
+        echo '</tbody></table>';
+        echo '<p class="description">Existing linked docs are overwritten with the current WordPress version. Any edits made directly in those docs will be replaced (they stay in the doc\'s Version history).</p>';
+    }
+
+    public function batch_start() {
+        if (!current_user_can('manage_options')) wp_die('Forbidden', 403);
+        check_admin_referer('mascamp_docsync_batch_start');
+        $type = sanitize_key($_POST['post_type'] ?? '');
+        if (!in_array($type, self::TYPES, true)) wp_die('Invalid content type.');
+        if ($this->batch_running()) $this->finish('error', 'A Sync all is already running. Wait for it to finish or cancel it first.');
+        $args = ['post_type' => $type, 'post_status' => 'publish', 'fields' => 'ids', 'posts_per_page' => -1, 'no_found_rows' => true, 'orderby' => 'date', 'order' => 'DESC'];
+        if (!empty($_POST['only_new'])) { $args['meta_key'] = self::META_DOC; $args['meta_compare'] = 'NOT EXISTS'; }
+        $ids = array_map('absint', get_posts($args));
+        if (!$ids) $this->finish('success', 'Nothing to sync: no matching published ' . self::type_label($type) . '.');
+        foreach ($ids as $id) { update_post_meta($id, self::META_STATUS, 'Queued'); delete_post_meta($id, self::META_ERROR); }
+        update_option(self::BATCH_OPTION, ['type' => $type, 'ids' => $ids, 'total' => count($ids), 'done' => 0, 'errors' => 0, 'started' => time(), 'pause_until' => 0], false);
+        delete_option(self::BATCH_LOCK);
+        wp_clear_scheduled_hook(self::BATCH_HOOK);
+        wp_schedule_single_event(time() + 30, self::BATCH_HOOK);
+        wp_safe_redirect(admin_url('options-general.php?page=mascamp-docsync')); exit;
+    }
+
+    public function batch_cancel() {
+        if (!current_user_can('manage_options')) wp_die('Forbidden', 403);
+        check_admin_referer('mascamp_docsync_batch_cancel');
+        $b = $this->batch();
+        foreach ((array) ($b['ids'] ?? []) as $id) {
+            if (get_post_meta($id, self::META_STATUS, true) === 'Queued') delete_post_meta($id, self::META_STATUS);
+        }
+        if ($b) { $b['ids'] = []; $b['finished'] = time(); $b['cancelled'] = true; update_option(self::BATCH_OPTION, $b, false); }
+        wp_clear_scheduled_hook(self::BATCH_HOOK);
+        delete_option(self::BATCH_LOCK);
+        $this->finish('success', 'Sync all cancelled.');
+    }
+
+    /** Browser-driven step: one item per request while the settings page is open. */
+    public function batch_ajax_step() {
+        if (!current_user_can('manage_options')) wp_send_json_error('forbidden', 403);
+        check_ajax_referer('mascamp_docsync_batch_step');
+        $wait = $this->batch_process(1, 50);
+        $b = $this->batch();
+        wp_send_json_success(['done' => (int) ($b['done'] ?? 0), 'total' => (int) ($b['total'] ?? 0), 'errors' => (int) ($b['errors'] ?? 0), 'finished' => !$this->batch_running(), 'wait' => $wait]);
+    }
+
+    /** Background step via WP-Cron: a few items, then reschedule itself. */
+    public function batch_cron() {
+        $wait = $this->batch_process(5, 40);
+        if ($this->batch_running() && !wp_next_scheduled(self::BATCH_HOOK)) wp_schedule_single_event(time() + max(20, $wait), self::BATCH_HOOK);
+    }
+
+    /**
+     * Processes up to $max items within ~$seconds. Returns seconds to wait (rate-limit pause), or 0.
+     * A lock prevents the browser loop and WP-Cron from syncing at the same time.
+     */
+    private function batch_process($max, $seconds) {
+        if (!$this->batch_running()) return 0;
+        $b = $this->batch();
+        if (!empty($b['pause_until']) && $b['pause_until'] > time()) return (int) $b['pause_until'] - time();
+        $lock = get_option(self::BATCH_LOCK);
+        if ($lock && (int) $lock > time() - 300) return 0; // another runner is busy; try again shortly
+        delete_option(self::BATCH_LOCK);
+        if (!add_option(self::BATCH_LOCK, time(), '', false)) return 0;
+
+        // Queue emptied but never marked finished (e.g. the last sync crashed): close it out.
+        $b = $this->batch();
+        if (empty($b['ids'])) {
+            $b['finished'] = time();
+            update_option(self::BATCH_OPTION, $b, false);
+            delete_option(self::BATCH_LOCK);
+            return 0;
+        }
+
+        if (function_exists('set_time_limit')) @set_time_limit(300);
+        $start = time(); $n = 0; $wait = 0;
+        while ($n < $max && (time() - $start) < $seconds) {
+            $b = $this->batch();
+            if (empty($b['ids']) || !empty($b['cancelled'])) break;
+            // Remove the item from the queue before syncing, so a crash can't retry it forever.
+            $id = (int) array_shift($b['ids']);
+            update_option(self::BATCH_OPTION, $b, false);
+            $result = $this->perform_sync($id);
+            $b = $this->batch(); // re-read: picks up a cancel made meanwhile
+            if (!empty($b['cancelled'])) break;
+            if (is_wp_error($result) && self::http_status($result) === 429) {
+                // Google rate limit: put it back, pause a minute.
+                array_push($b['ids'], $id);
+                update_post_meta($id, self::META_STATUS, 'Queued');
+                delete_post_meta($id, self::META_ERROR);
+                $b['pause_until'] = time() + 65;
+                update_option(self::BATCH_OPTION, $b, false);
+                $wait = 65;
+                break;
+            }
+            $b['done'] = (int) $b['done'] + 1;
+            if ($result !== true) $b['errors'] = (int) $b['errors'] + 1;
+            if (empty($b['ids'])) $b['finished'] = time();
+            update_option(self::BATCH_OPTION, $b, false);
+            $n++;
+        }
+        delete_option(self::BATCH_LOCK);
+        return $wait;
+    }
+
     /* ---------------------------------------------------------------- Google API */
 
     private function api($method, $url, $body = null) {
@@ -360,6 +524,10 @@ final class Module {
     private static function http_status($error) {
         $d = is_wp_error($error) ? $error->get_error_data() : null;
         return is_array($d) ? (int) ($d['status'] ?? 0) : 0;
+    }
+
+    private function rate_limited($error) {
+        return new \WP_Error('rate_limited', 'Google rate limit reached. Wait a minute and sync again.', ['status' => 429, 'google' => $error->get_error_message()]);
     }
 
     private function plain_title($post_id) {
@@ -448,9 +616,12 @@ final class Module {
                 return ['insertInlineImage' => ['location' => ['index' => $img['index']], 'uri' => $img['url'], 'objectSize' => ['width' => ['magnitude' => $img['width'], 'unit' => 'PT']]]];
             }, $images);
             $ok = $this->api('POST', 'https://docs.googleapis.com/v1/documents/' . rawurlencode($doc_id) . ':batchUpdate', ['requests' => $all]);
+            if (is_wp_error($ok) && self::http_status($ok) === 429) return $this->mark_error($post_id, $this->rate_limited($ok));
             if (is_wp_error($ok)) {
                 foreach ($images as $k => $img) {
                     $one = $this->api('POST', 'https://docs.googleapis.com/v1/documents/' . rawurlencode($doc_id) . ':batchUpdate', ['requests' => [$all[$k]]]);
+                    // Rate limit isn't the image's fault: stop and let the whole post be retried later.
+                    if (is_wp_error($one) && self::http_status($one) === 429) return $this->mark_error($post_id, $this->rate_limited($one));
                     if (is_wp_error($one)) {
                         $warnings[] = 'Image skipped: ' . $img['url'] . ' (' . $one->get_error_message() . ')';
                         $label = '[Image: ' . $img['url'] . ']';

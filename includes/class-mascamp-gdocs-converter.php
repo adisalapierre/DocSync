@@ -66,6 +66,7 @@ final class Converter {
             if ($child->nodeType !== XML_ELEMENT_NODE) continue;
             $tag = strtolower($child->nodeName);
             if (in_array($tag, self::$skip, true)) continue;
+            if (self::hidden($child)) continue;
 
             if ($tag === 'br' || $tag === 'hr') { $this->flush(); continue; }
             if ($tag === 'img') { $this->image($child); continue; }
@@ -196,6 +197,23 @@ final class Converter {
     }
 
     /* ------------------------------------------------------------ Helpers */
+
+    /**
+     * Elements that are invisible on desktop or duplicated by page builders (Elementor & co.):
+     * screen-reader text, mobile-only copies, tab titles rendered twice, cloned slider slides.
+     */
+    private static $hidden_classes = [
+        'screen-reader-text', 'sr-only', 'elementor-screen-only', 'elementor-hidden-desktop',
+        'elementor-tab-desktop-title', 'swiper-slide-duplicate', 'slick-cloned',
+    ];
+    private static function hidden(\DOMElement $el) {
+        $style = strtolower(str_replace(' ', '', $el->getAttribute('style')));
+        if (strpos($style, 'display:none') !== false || $el->hasAttribute('hidden')) return true;
+        $class = ' ' . $el->getAttribute('class') . ' ';
+        if (trim($class) === '') return false;
+        foreach (self::$hidden_classes as $c) if (strpos($class, ' ' . $c . ' ') !== false) return true;
+        return false;
+    }
 
     private static function run($text, array $ctx) {
         return ['text' => $text, 'bold' => !empty($ctx['bold']), 'italic' => !empty($ctx['italic']), 'underline' => !empty($ctx['underline']), 'link' => $ctx['link'] ?? null];

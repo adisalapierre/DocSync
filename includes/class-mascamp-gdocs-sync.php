@@ -475,9 +475,26 @@ final class Module {
         $post = get_post($post_id);
         $GLOBALS['post'] = $post; // some content filters/shortcodes expect the global post
         setup_postdata($post);
-        $html = apply_filters('the_content', $post->post_content);
+        $html = '';
+        // Elementor pages keep their real layout in _elementor_data; post_content is only a simplified fallback.
+        if ($this->is_elementor($post_id)) {
+            try {
+                $html = (string) \Elementor\Plugin::instance()->frontend->get_builder_content_for_display($post_id, false);
+            } catch (\Throwable $e) {
+                $html = '';
+            }
+        }
+        if (trim(wp_strip_all_tags($html)) === '' && strpos($html, '<img') === false) {
+            $html = apply_filters('the_content', $post->post_content);
+        }
         wp_reset_postdata();
         return $html;
+    }
+
+    private function is_elementor($post_id) {
+        return class_exists('\Elementor\Plugin')
+            && get_post_meta($post_id, '_elementor_edit_mode', true) === 'builder'
+            && isset(\Elementor\Plugin::instance()->frontend);
     }
 
     private function mark_error($post_id, $error) {

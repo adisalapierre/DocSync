@@ -1,6 +1,6 @@
 # MasCamp DocSync
 
-**Version 0.5.0** · WordPress plugin · PHP 7.4+
+**Version 0.5.1** · WordPress plugin · PHP 7.4+
 
 MasCamp DocSync keeps chosen WordPress posts and pages in sync with **Google Docs** and with a **Git repository** (GitHub, GitLab, Bitbucket Cloud or Gitea), and installs and updates **plugins and themes straight from Git**.
 
@@ -36,6 +36,9 @@ Nothing syncs unless you choose it.
 ## Installation
 
 **From the zip (live sites):** go to **Plugins → Add New → Upload Plugin**, upload `mascamp-docsync.zip`, choose **Replace current with uploaded** if asked, then activate **MasCamp DocSync**.
+
+- Use the `mascamp-docsync.zip` release file. GitHub's green **Code → Download ZIP** button names the folder `DocSync-main`, which WordPress installs as a *second* copy instead of replacing the first.
+- Only one copy can run. If DocSync is already active from another folder (for example `DocSync`, installed by Deployer for Git), activating a second copy stops with a message naming both folders instead of a fatal error. Delete the copy you don't want; settings live in the database and are kept.
 
 **From Git (development):** clone the repository straight into the plugins folder, so that the folder *is* the repository:
 ```
@@ -375,6 +378,9 @@ mascamp-docsync/
 ---
 
 ## Changelog
+
+**0.5.1**
+- Installing a second copy of DocSync (a zip next to a Deployer for Git install, or a GitHub "Download ZIP") no longer causes a fatal error on activation. It explains which folder is already active instead.
 
 **0.5.0**
 - **Plugin Sync** and **Theme Sync** tabs: install and update plugins and themes from GitHub, GitLab, Bitbucket or Gitea.

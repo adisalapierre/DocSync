@@ -574,6 +574,7 @@ final class Module {
 
     private function step_label(array $st) {
         if ($st['kind'] === 'scan') return 'Checking ' . ($st['dest'] === 'git' ? 'Git repository' : 'Google Drive') . ' for changes…';
+        if ($st['kind'] === 'pull') return '“' . self::plain_title($st['id']) . '” ← Google Docs';
         $d = $this->dest($st['dest']);
         return '“' . self::plain_title($st['id']) . '” → ' . ($d ? $d->label() : $st['dest']);
     }
@@ -614,8 +615,15 @@ final class Module {
             if ($st['kind'] === 'scan') {
                 $found = $this->monitor->scan_dest($st['dest']);
                 $result = is_wp_error($found) ? $found : true;
+            } elseif ($st['kind'] === 'pull') {
+                $d = $this->dest('gdocs');
+                $r = ($d && method_exists($d, 'pull')) ? $d->pull((int) $st['id']) : new \WP_Error('no_pull', 'Pull isn’t available.');
+                $result = is_wp_error($r) ? $r : true;
             } else {
+                $d = $this->dest($st['dest']);
+                if ($d && !empty($st['force'])) $d->set_force(true);
                 $result = $this->run($st['dest'], (int) $st['id']);
+                if ($d) $d->set_force(false);
             }
 
             $b = $this->batch(); // re-read: picks up a cancel made meanwhile
@@ -634,8 +642,8 @@ final class Module {
             if ($result !== true) {
                 $b['errors'] = (int) $b['errors'] + 1;
                 $b['failures'] = array_slice(array_merge((array) ($b['failures'] ?? []), [[
-                    'id' => $st['kind'] === 'sync' ? (int) $st['id'] : 0,
-                    'title' => $st['kind'] === 'sync' ? self::plain_title($st['id']) : $this->step_label($st),
+                    'id' => $st['kind'] !== 'scan' ? (int) $st['id'] : 0,
+                    'title' => $st['kind'] !== 'scan' ? self::plain_title($st['id']) : $this->step_label($st),
                     'error' => is_wp_error($result) ? $result->get_error_message() : 'Unknown error',
                 ]]), -100);
                 // The first few all failed the same way: it's a setup problem, so stop instead of failing every post.

@@ -29,6 +29,7 @@ final class Monitor {
         add_action('admin_post_mascamp_docsync_monitor_sync_wp', [$this, 'sync_wp_handler']);
         add_action('admin_post_mascamp_docsync_monitor_sync_new', [$this, 'sync_new_handler']);
         add_action('admin_post_mascamp_docsync_monitor_ignore', [$this, 'ignore_handler']);
+        add_action('admin_post_mascamp_docsync_monitor_bulk', [$this, 'bulk_handler']);
         add_action('mascamp_docsync_after_run', [$this, 'after_run'], 10, 3);
         add_action('save_post', [$this, 'after_save'], 30, 2);
     }
@@ -286,6 +287,56 @@ final class Monitor {
         wp_safe_redirect($this->core->settings_url('changes')); exit;
     }
 
+    /** Bulk actions on ticked rows of the Changes list → one background job with progress. */
+    public function bulk_handler() {
+        if (!current_user_can('manage_options')) wp_die('Forbidden', 403);
+        check_admin_referer('mascamp_docsync_monitor_bulk');
+        $op = sanitize_key($_POST['bulk_op'] ?? '');
+        $sel = array_map('sanitize_text_field', (array) wp_unslash($_POST['sel'] ?? []));
+        $items = $this->data()['items'];
+        $steps = []; $skipped = []; $ignored = 0;
+        foreach ($sel as $key) {
+            if (!preg_match('/^(gdocs|git):(\d+)$/', $key, $m) || !isset($items[$key])) continue;
+            $it = $items[$key]; $dest = $m[1]; $pid = (int) $m[2];
+            $d = $this->core->dest($dest);
+            $published = get_post_status($pid) === 'publish';
+            switch ($op) {
+                case 'fix':
+                    if (in_array($it['state'], ['remote', 'both'], true)) { $skipped[] = Module::plain_title($pid) . ' (needs your decision: pull or overwrite)'; break; }
+                    if (!$published) { $skipped[] = Module::plain_title($pid) . ' (not published)'; break; }
+                    $steps[] = ['kind' => 'sync', 'dest' => $dest, 'id' => $pid, 'force' => in_array($it['state'], ['wrong', 'missing'], true)];
+                    break;
+                case 'overwrite':
+                    if (!$published) { $skipped[] = Module::plain_title($pid) . ' (not published)'; break; }
+                    $steps[] = ['kind' => 'sync', 'dest' => $dest, 'id' => $pid, 'force' => true];
+                    break;
+                case 'pull':
+                    if ($dest !== 'gdocs' || !$d->meta($pid, 'link') || Module::is_elementor($pid)) { $skipped[] = Module::plain_title($pid) . ($dest !== 'gdocs' ? ' (Git can’t be pulled)' : (Module::is_elementor($pid) ? ' (Elementor page: one-way)' : ' (no linked doc)')); break; }
+                    $steps[] = ['kind' => 'pull', 'dest' => 'gdocs', 'id' => $pid];
+                    break;
+                case 'ignore':
+                    if ($it['state'] !== 'new') { $skipped[] = Module::plain_title($pid) . ' (only “not synced yet” rows can be ignored)'; break; }
+                    update_post_meta($pid, $d->ignore_key(), '1');
+                    $this->refresh_post($pid);
+                    Log::add('Change detected', 'Post set to not sync to ' . Log::target($dest) . ' (ignored)', $pid, $dest, 'info');
+                    $ignored++;
+                    break;
+            }
+        }
+        $msg = [];
+        if ($op === 'ignore') $msg[] = sprintf('%d item(s) ignored.', $ignored);
+        if ($steps) {
+            $labels = ['fix' => 'Fixing %d selected item(s)', 'overwrite' => 'Overwriting %d copy(ies) with the WordPress version', 'pull' => 'Pulling %d Google Doc(s) into WordPress'];
+            if ($this->core->start_job(sprintf($labels[$op], count($steps)), $steps)) $msg[] = sprintf('Started: %d item(s). Progress is shown above.', count($steps));
+            else $msg[] = 'Another DocSync job is running. Try again when it finishes.';
+        } elseif ($op !== 'ignore' && !$skipped) {
+            $msg[] = 'Nothing selected.';
+        }
+        if ($skipped) $msg[] = count($skipped) . ' skipped: ' . implode('; ', array_slice($skipped, 0, 6)) . (count($skipped) > 6 ? '…' : '');
+        $this->core->notice($skipped && !$steps ? 'warning' : 'success', implode(' ', $msg));
+        wp_safe_redirect($this->core->settings_url('changes')); exit;
+    }
+
     /** Hide a post from "Not synced yet" for one destination (undo: sync it, which clears the flag). */
     public function ignore_handler() {
         $dest = sanitize_key($_GET['dest'] ?? '');
@@ -450,24 +501,38 @@ final class Monitor {
         }
 
         // Filter + table
-        echo '<p><label>Show: <select id="mcds-filter"><option value="">All (' . count($items) . ')</option><option value="wp">Edited in WordPress</option><option value="gdocs">Google Docs</option><option value="git">Git</option><option value="new">Not synced yet</option><option value="error">Problems</option></select></label></p>';
+        echo '<p><label>Show: <select id="mcds-filter"><option value="">All (' . count($items) . ')</option><option value="wp">Edited in WordPress</option><option value="gdocs">Google Docs</option><option value="git">Git</option><option value="new">Not synced yet</option><option value="wrong">Holds another post’s content</option><option value="error">Problems</option></select></label></p>';
+        // Bulk bar: acts on the ticked rows (select-all ticks only the rows currently shown by the filter).
+        echo '<form method="post" action="' . esc_url(admin_url('admin-post.php')) . '" id="mcds-bulk-form">';
+        echo '<input type="hidden" name="action" value="mascamp_docsync_monitor_bulk">';
+        wp_nonce_field('mascamp_docsync_monitor_bulk');
+        echo '<div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:0 0 8px">';
+        echo '<select name="bulk_op" id="mcds-bulk-op"><option value="">Bulk actions</option>';
+        echo '<option value="fix">Fix selected (recommended action for each)</option>';
+        echo '<option value="overwrite">Overwrite with WordPress version</option>';
+        echo '<option value="pull">Pull Google Doc into WordPress</option>';
+        echo '<option value="ignore">Ignore (not synced yet only)</option></select>';
+        echo '<button type="submit" class="button"' . ($running ? ' disabled title="Wait for the current job to finish"' : '') . '>Apply</button>';
+        echo '<span id="mcds-sel-count" style="color:#646970">0 selected</span>';
+        echo '</div>';
         uasort($items, static function ($a, $b) {
             $order = ['wrong' => 0, 'error' => 1, 'both' => 2, 'missing' => 3, 'remote' => 4, 'wp' => 5, 'new' => 6];
             return [$order[$a['state']] ?? 9, -max($a['wp']['when'] ?? 0, $a['remote']['when'] ?? 0)] <=> [$order[$b['state']] ?? 9, -max($b['wp']['when'] ?? 0, $b['remote']['when'] ?? 0)];
         });
-        echo '<table class="widefat striped" id="mcds-changes" style="max-width:1200px"><thead><tr><th style="width:24%">Post</th><th style="width:16%">Where</th><th>What changed</th><th style="width:24%;text-align:right">Action</th></tr></thead><tbody>';
+        echo '<table class="widefat striped" id="mcds-changes" style="max-width:1200px"><thead><tr><td class="check-column" style="width:28px;padding:8px 0 0 8px"><input type="checkbox" id="mcds-sel-all" title="Select all shown"></td><th style="width:24%">Post</th><th style="width:16%">Where</th><th>What changed</th><th style="width:24%;text-align:right">Action</th></tr></thead><tbody>';
         foreach ($items as $it) {
             $d = $this->core->dest($it['dest']);
             if (!$d) continue;
             $pid = $it['post'];
             $is_docs = $it['dest'] === 'gdocs';
             $remote_name = $is_docs ? 'Google Doc' : 'Git file';
+            $confirmed = (int) ($it['remote']['other'] ?? 0) > 0;
             $badge = [
                 'wp'      => ['WordPress is newer', '#dba617'],
                 'remote'  => [$remote_name . ' is newer', '#2271b1'],
                 'both'    => ['Changed on both sides', '#d63638'],
                 'missing' => [$remote_name . ' missing', '#d63638'],
-                'wrong'   => ['Holds another post’s content', '#d63638'],
+                'wrong'   => $confirmed ? ['Holds another post’s content', '#d63638'] : ['Needs checking', '#dba617'],
                 'new'     => ['Not synced yet', '#8c8f94'],
                 'error'   => ['Sync failed', '#d63638'],
             ][$it['state']];
@@ -518,13 +583,27 @@ final class Monitor {
                     break;
             }
             $filter = in_array($it['state'], ['error', 'wrong'], true) ? 'error ' . $it['dest'] : ($it['state'] === 'new' ? 'new ' . $it['dest'] : trim((in_array($it['state'], ['wp', 'both'], true) ? 'wp ' : '') . (in_array($it['state'], ['remote', 'both', 'missing'], true) ? $it['dest'] : '')));
+            if ($it['state'] === 'wrong') $filter .= ' wrong';
             echo '<tr data-filter="' . esc_attr($filter) . '">';
-            echo '<td><a href="' . esc_url(get_edit_post_link($pid, 'url')) . '"><strong>' . esc_html(Module::plain_title($pid)) . '</strong></a><br><small style="color:#646970">' . esc_html(ucfirst(get_post_type($pid))) . (get_post_status($pid) !== 'publish' ? ' · ' . esc_html(get_post_status($pid)) : '') . ' · <a href="' . esc_url(add_query_arg(['post_id' => $pid], $this->core->settings_url('changes'))) . '#mcds-log">activity history</a></small></td>';
+            echo '<th scope="row" class="check-column" style="padding:10px 0 0 8px"><input type="checkbox" class="mcds-sel" name="sel[]" value="' . esc_attr($it['dest'] . ':' . $pid) . '"></th>';
+            echo '<td><a href=""' . esc_url(get_edit_post_link($pid, 'url')) . '"><strong>' . esc_html(Module::plain_title($pid)) . '</strong></a><br><small style="color:#646970">' . esc_html(ucfirst(get_post_type($pid))) . (get_post_status($pid) !== 'publish' ? ' · ' . esc_html(get_post_status($pid)) : '') . ' · <a href="' . esc_url(add_query_arg(['post_id' => $pid], $this->core->settings_url('changes'))) . '#mcds-log">activity history</a></small></td>';
             echo '<td><strong>' . esc_html($d->label()) . '</strong><br><span style="display:inline-block;margin-top:3px;padding:1px 8px;border-radius:10px;font-size:11px;color:#fff;background:' . esc_attr($badge[1]) . '">' . esc_html($badge[0]) . '</span></td>';
             echo '<td>' . implode('<br>', $what) . '</td>';
             echo '<td style="text-align:right">' . implode(' ', $actions) . '</td></tr>';
         }
-        echo '</tbody></table>';
-        echo "<script>(function(){var s=document.getElementById('mcds-filter');if(!s)return;s.addEventListener('change',function(){var v=s.value;document.querySelectorAll('#mcds-changes tbody tr').forEach(function(tr){tr.style.display=!v||(' '+tr.getAttribute('data-filter')+' ').indexOf(' '+v+' ')>-1?'':'none';});});})();</script>";
+        echo '</tbody></table></form>';
+        echo "<script>(function(){
+  var s=document.getElementById('mcds-filter'),all=document.getElementById('mcds-sel-all'),cnt=document.getElementById('mcds-sel-count'),form=document.getElementById('mcds-bulk-form');
+  function rows(){return Array.prototype.slice.call(document.querySelectorAll('#mcds-changes tbody tr'));}
+  function count(){var n=document.querySelectorAll('#mcds-changes .mcds-sel:checked').length;if(cnt)cnt.textContent=n+' selected';return n;}
+  if(s)s.addEventListener('change',function(){var v=s.value;rows().forEach(function(tr){var show=!v||(' '+tr.getAttribute('data-filter')+' ').indexOf(' '+v+' ')>-1;tr.style.display=show?'':'none';if(!show){var c=tr.querySelector('.mcds-sel');if(c)c.checked=false;}});if(all)all.checked=false;count();});
+  if(all)all.addEventListener('change',function(){rows().forEach(function(tr){if(tr.style.display==='none')return;var c=tr.querySelector('.mcds-sel');if(c)c.checked=all.checked;});count();});
+  document.addEventListener('change',function(e){if(e.target.classList&&e.target.classList.contains('mcds-sel'))count();});
+  if(form)form.addEventListener('submit',function(e){var n=count(),op=document.getElementById('mcds-bulk-op').value;
+    if(!op){e.preventDefault();alert('Choose a bulk action first.');return;}
+    if(!n){e.preventDefault();alert('Tick at least one row (or use the box in the header to select all shown).');return;}
+    var msg={fix:'Run the recommended action on '+n+' item(s)? Rows changed on both sides or edited remotely are skipped, since they need your decision.',overwrite:'Overwrite the Google Doc / Git copy of '+n+' item(s) with the WordPress version? Remote edits in those copies will be replaced (still in their version history).',pull:'Replace the WordPress content of the selected Google Docs item(s) with the doc version? The current versions are kept in Revisions.',ignore:'Stop listing the selected not-synced-yet item(s)?'}[op];
+    if(!confirm(msg)){e.preventDefault();}});
+})();</script>";
     }
 }

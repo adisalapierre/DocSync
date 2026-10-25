@@ -567,12 +567,14 @@ final class GDocsDestination extends Destination {
             }
             // One-time check that the doc really holds this post (a duplicated post may have written into it).
             if (get_post_meta($pid, $this->verified_key(), true) !== '1' && $verifies++ < 100) {
-                $other = $this->doc_holds_other($doc_id, $pid);
-                if ($other === null) { /* couldn't read: try again next scan */ }
-                elseif ($other) {
-                    $items[$pid] = ['state' => 'wrong', 'when' => strtotime($f['modifiedTime'] ?? '') ?: 0, 'by' => '', 'other' => $other,
-                        'detail' => 'This doc holds ' . ($other > 0 ? '“' . Module::plain_title($other) . '” (#' . $other . ')' : 'another post') . ' instead of this ' . get_post_type($pid) . ', written there by a duplicated post. Restore it from WordPress.',
-                        'url' => $this->view_url($pid)];
+                $chk = $this->doc_holds_other($doc_id, $pid);
+                if ($chk === null) { /* couldn't read: try again next scan */ }
+                elseif ($chk['other']) {
+                    $other = (int) $chk['other'];
+                    $detail = $other > 0
+                        ? 'This doc holds “' . Module::plain_title($other) . '” (#' . $other . ') instead of this ' . get_post_type($pid) . ', written there by a duplicated post. Restore it from WordPress.'
+                        : 'This doc doesn’t look like this ' . get_post_type($pid) . ': its title is “' . ($chk['title'] !== '' ? $chk['title'] : '(none)') . '” and its source link is ' . $chk['url'] . '. Open it to check; if it’s wrong, restore it from WordPress.';
+                    $items[$pid] = ['state' => 'wrong', 'when' => strtotime($f['modifiedTime'] ?? '') ?: 0, 'by' => '', 'other' => $other, 'detail' => $detail, 'url' => $this->view_url($pid)];
                     continue;
                 } else {
                     update_post_meta($pid, $this->verified_key(), '1');
@@ -599,13 +601,15 @@ final class GDocsDestination extends Destination {
     }
 
     /**
-     * Reads the doc's "Source: <permalink>" header line (written by every push).
-     * @return int|null 0 = this post's (or no header: imported doc), >0 = other post's ID, -1 = another unknown page, null = couldn't read
+     * Does the doc hold a different post? Reads the "Source: <link>" header (written by every push)
+     * and the Title line. Only a confident mismatch is reported, so docs synced from another address
+     * (local/staging site, old permalink, ?p= links) aren't flagged by mistake.
+     * @return array|null null = couldn't read; ['other' => 0] = this post's; ['other' => id|-1, 'url' => …, 'title' => …] = someone else's
      */
     private function doc_holds_other($doc_id, $post_id) {
-        $d = $this->api('GET', 'https://docs.googleapis.com/v1/documents/' . rawurlencode($doc_id) . '?fields=body.content(paragraph(elements(textRun(content))))');
+        $d = $this->api('GET', 'https://docs.googleapis.com/v1/documents/' . rawurlencode($doc_id) . '?fields=body.content(paragraph(elements(textRun(content)),paragraphStyle(namedStyleType)))');
         if (is_wp_error($d)) return null;
-        $n = 0;
+        $n = 0; $title = ''; $url = '';
         foreach ($d['body']['content'] ?? [] as $el) {
             if (!isset($el['paragraph'])) continue;
             $text = '';
@@ -613,15 +617,30 @@ final class GDocsDestination extends Destination {
             $text = trim($text);
             if ($text === '') continue;
             if (++$n > 6) break;
-            if (strpos($text, 'Source:') !== 0) continue;
-            $url = trim(substr($text, 7));
-            $mine = get_permalink($post_id);
-            if (untrailingslashit($url) === untrailingslashit((string) $mine)) return 0;
-            $other = url_to_postid($url);
-            if ($other === (int) $post_id) return 0; // permalink changed since; same post
-            return $other ?: -1;
+            if ($title === '' && ($el['paragraph']['paragraphStyle']['namedStyleType'] ?? '') === 'TITLE') $title = $text;
+            if (strpos($text, 'Source:') === 0) { $url = trim(substr($text, 7)); break; }
         }
-        return 0;
+        if ($url === '') return ['other' => 0]; // no header: imported/hand-written doc
+        $norm = static function ($u) { return strtolower(untrailingslashit(preg_replace('~^https?://~i', '', (string) $u))); };
+        if ($norm($url) === $norm(get_permalink($post_id))) return ['other' => 0];
+
+        $other = (int) url_to_postid($url);
+        if ($other === (int) $post_id) return ['other' => 0];               // old permalink of this post
+        if ($other > 0) return ['other' => $other, 'url' => $url, 'title' => $title]; // confidently another post
+
+        // Link not recognised on this site: decide by what else we know about the doc.
+        $post = get_post($post_id);
+        $slug = basename((string) parse_url($url, PHP_URL_PATH));
+        parse_str((string) parse_url($url, PHP_URL_QUERY), $q);
+        if ($post && $slug !== '' && $slug === $post->post_name) return ['other' => 0];                         // same slug, other address
+        if (!empty($q['p']) && (int) $q['p'] === (int) $post_id) return ['other' => 0];
+        if (!empty($q['page_id']) && (int) $q['page_id'] === (int) $post_id) return ['other' => 0];
+        $clean = static function ($t) { return strtolower(trim(preg_replace('/\s*\((incomplete|draft)\)\s*$/i', '', html_entity_decode((string) $t, ENT_QUOTES, 'UTF-8')))); };
+        if ($title !== '' && $clean($title) === $clean(Module::plain_title($post_id))) return ['other' => 0]; // same title
+        $host = strtolower((string) parse_url($url, PHP_URL_HOST));
+        $site = strtolower((string) parse_url(home_url(), PHP_URL_HOST));
+        if ($title === '' && $host !== '' && $host !== $site) return ['other' => 0]; // synced from another site; nothing contradicts it
+        return ['other' => -1, 'url' => $url, 'title' => $title];
     }
 
     /* ---------------------------------------------------------------- Import new posts from a Drive folder */

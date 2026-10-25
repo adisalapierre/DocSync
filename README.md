@@ -96,6 +96,14 @@ Each post's link to its Git file and Google Doc is stamped with that post's ID. 
 | Published but never synced: a new post, or a duplicate whose copied link was removed | Not synced yet ("Duplicated from …") | Sync to … / Ignore |
 | The Git file or Google Doc holds a *different* post's content (written by a duplicate before 0.3.1) | Holds another post's content | Restore from WordPress |
 
+- **Bulk actions:** tick rows, or use the header box to select every row the *Show* filter is currently showing. Then choose an action:
+  - **Fix selected:** each row's recommended action (Sync, Restore, Recreate or Retry). Rows edited remotely or on both sides are skipped, because they need your decision.
+  - **Overwrite with WordPress version**
+  - **Pull Google Doc into WordPress**
+  - **Ignore:** for *Not synced yet* rows.
+
+  The action runs as one background job with a progress bar.
+- **Content check:** a copy is flagged *Holds another post's content* only when its Git front matter, or its Google Doc's *Source:* link, names another post on this site. A doc whose link isn't recognised (for example it was synced from a local or staging site) is accepted when its slug or title matches the post. Otherwise it's shown as *Needs checking*, with the doc's title and link.
 - **Sync all WordPress changes** pushes every item that changed *only* in WordPress. Anything edited remotely is never overwritten by this button.
 - **How changes are detected:** WordPress edits are detected immediately. Google Drive and Git are checked hourly, or straight away with **Scan now**. A check uses one Drive folder listing and one repository tree listing. Only docs whose modified time changed get a second, precise revision check, so renames and sharing changes aren't reported as edits.
 - **Bitbucket** can't list file versions cheaply, so only WordPress-side Git changes are shown for Bitbucket repositories.

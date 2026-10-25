@@ -128,6 +128,8 @@ Headings are **Push**, **Pull**, **Update**, **Sync Update** (scans), **Change d
 - **Single actions** (*Sync to Google Docs/Git now*, *Pull from Google Doc*, *Retry*, *Import*) show a "working…" notification as soon as you click. They usually take a few seconds. If you leave the page during one, it still finishes on the server.
 
 ## Notes and limitations
+- **Password-protected posts:** the real content is synced (not the password form), and the title has no "Protected:" label. Google Docs gets the full content. Git gets the post's details with `password_protected: true` and a note instead of the content, unless *Include their content in the repository* is switched on in the Git settings.
+- **Emoji:** emoji that WordPress shows as small images (📍, ✅…) are kept as emoji characters rather than skipped images.
 - Elementor pages are synced from their rendered content. Page-builder layout (columns, spacing, backgrounds) is not kept: content comes through stacked in page order.
 - Only published posts and pages sync, and each sync copies the last *saved* version.
 - Automatic, bulk and background syncs use WP-Cron, which needs site traffic or a real server cron calling `wp-cron.php`.

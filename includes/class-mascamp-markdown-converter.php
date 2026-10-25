@@ -63,6 +63,7 @@ final class MarkdownConverter {
                 if ($text === '') return '';
                 return $href ? '[' . $text . '](' . self::url($href) . ')' : $text;
             case 'img':
+                if (Converter::is_emoji($n)) return $n->getAttribute('alt');
                 $src = Converter::image_src($n);
                 if (!$src) return '';
                 $alt = str_replace(['[', ']', "\n"], ['\\[', '\\]', ' '], trim($n->getAttribute('alt')));

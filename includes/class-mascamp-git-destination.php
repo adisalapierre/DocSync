@@ -33,7 +33,7 @@ final class GitDestination extends Destination {
     private function settings() {
         return wp_parse_args(get_option($this->option, []), [
             'provider' => 'github', 'repo_url' => '', 'branch' => 'main', 'username' => '', 'token' => '',
-            'folder' => 'wordpress-content', 'auto_sync' => '1',
+            'folder' => 'wordpress-content', 'auto_sync' => '1', 'protected' => '0',
         ]);
     }
 
@@ -83,6 +83,7 @@ final class GitDestination extends Destination {
                     'token'     => !empty($v['clear_token']) ? '' : self::keep_secret($v['token'] ?? null, $old['token']),
                     'folder'    => self::clean_folder($v['folder'] ?? ''),
                     'auto_sync' => !empty($v['auto_sync']) ? '1' : '0',
+                    'protected' => !empty($v['protected']) ? '1' : '0',
                 ];
             },
         ]);
@@ -130,6 +131,7 @@ final class GitDestination extends Destination {
         echo '<p class="description">A token is always needed to push, for public and private repositories alike. It is stored in the WordPress options table; for hardened deployments define <code>MASCAMP_DOCSYNC_GIT_TOKEN</code> in wp-config.php instead.</p></td></tr>';
 
         echo '<tr><th>Automatic sync</th><td><label><input type="checkbox" name="' . $n . '[auto_sync]" value="1" ' . checked($s['auto_sync'], '1', false) . '> Commit automatically when a post marked <em>Keep synced</em> is updated</label><p class="description">Untick to pause all automatic Git syncing.</p></td></tr>';
+        echo '<tr><th>Password-protected posts</th><td><label><input type="checkbox" name="' . $n . '[protected]" value="1" ' . checked($s['protected'], '1', false) . '> Include their content in the repository</label><p class="description">Off by default, because repositories can be public: protected posts are committed with their details only, plus a note that the content is protected. Google Docs always gets the full content (your Drive is private).</p></td></tr>';
         echo '<tr><th>Images</th><td><p>Referenced by their website URL. Image files are never copied into the repository.</p></td></tr>';
         echo '</table>';
         submit_button('Save Git settings');
@@ -229,7 +231,10 @@ final class GitDestination extends Destination {
         $thumb = get_the_post_thumbnail_url($id, 'full');
         if ($thumb) $fm[] = 'featured_image: ' . $q($thumb);
 
-        $body = MarkdownConverter::convert(Module::content_html($id));
+        if (Module::is_protected($id)) $fm[] = 'password_protected: true';
+        $body = (Module::is_protected($id) && $this->settings()['protected'] !== '1')
+            ? '_This ' . $post->post_type . ' is password-protected; its content isn’t published to the repository._'
+            : MarkdownConverter::convert(Module::content_html($id));
         return "---\n" . implode("\n", $fm) . "\n---\n\n" . ($body !== '' ? $body . "\n" : '');
     }
 

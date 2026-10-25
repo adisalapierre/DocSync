@@ -58,6 +58,14 @@ final class Converter {
         return (new \DOMXPath($dom))->query('//div[@id="mc-root"]')->item(0);
     }
 
+    /** WordPress swaps emoji (📍, ✅…) for small SVG images Google can't load; the alt text is the emoji itself. */
+    public static function is_emoji(\DOMElement $el) {
+        $alt = trim($el->getAttribute('alt'));
+        if ($alt === '' || mb_strlen($alt, 'UTF-8') > 8) return false;
+        return strpos(' ' . $el->getAttribute('class') . ' ', ' emoji ') !== false || strpos(' ' . $el->getAttribute('class') . ' ', ' wp-smiley ') !== false
+            || preg_match('~/images/core/emoji/~', $el->getAttribute('src'));
+    }
+
     /** Best image URL for an <img>, handling lazy-load attributes. Shared with the Markdown converter. */
     public static function image_src(\DOMElement $el) {
         $src = $el->getAttribute('src');
@@ -87,7 +95,7 @@ final class Converter {
             if (self::hidden($child)) continue;
 
             if ($tag === 'br' || $tag === 'hr') { $this->flush(); continue; }
-            if ($tag === 'img') { $this->image($child); continue; }
+            if ($tag === 'img') { $this->image($child, $ctx); continue; }
 
             $next = $ctx;
             if (in_array($tag, ['strong', 'b', 'th'], true)) $next['bold'] = true;
@@ -148,7 +156,8 @@ final class Converter {
         else $this->current['runs'][] = $run;
     }
 
-    private function image(\DOMElement $el) {
+    private function image(\DOMElement $el, array $ctx = []) {
+        if (self::is_emoji($el)) { $this->text($el->getAttribute('alt'), $ctx); return; }
         $url = self::image_src($el);
         if (!$url) return;
         $this->flush();

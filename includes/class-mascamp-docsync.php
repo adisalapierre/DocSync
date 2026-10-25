@@ -362,7 +362,9 @@ final class Module {
     /* ---------------------------------------------------------------- Shared content helpers */
 
     public static function plain_title($post_id) {
-        $t = html_entity_decode(wp_strip_all_tags(get_the_title($post_id)), ENT_QUOTES | ENT_HTML5, 'UTF-8');
+        // The raw title: get_the_title() would add "Protected: " / "Private: " for password-protected/private posts.
+        $raw = (string) get_post_field('post_title', $post_id);
+        $t = html_entity_decode(wp_strip_all_tags($raw !== '' ? $raw : get_the_title($post_id)), ENT_QUOTES | ENT_HTML5, 'UTF-8');
         return trim($t) !== '' ? trim($t) : 'WordPress post ' . $post_id;
     }
 
@@ -371,6 +373,9 @@ final class Module {
         $post = get_post($post_id);
         $GLOBALS['post'] = $post; // some content filters/shortcodes expect the global post
         setup_postdata($post);
+        // Password-protected posts: render the real content, not the password form (syncing runs as an editor).
+        $unlock = static function () { return false; };
+        add_filter('post_password_required', $unlock, 99);
         $html = '';
         if (self::is_elementor($post_id) && isset(\Elementor\Plugin::instance()->frontend)) {
             try {
@@ -382,8 +387,14 @@ final class Module {
         if (trim(wp_strip_all_tags($html)) === '' && strpos($html, '<img') === false) {
             $html = apply_filters('the_content', $post->post_content);
         }
+        remove_filter('post_password_required', $unlock, 99);
         wp_reset_postdata();
         return $html;
+    }
+
+    /** Password-protected? (Content is still synced to Google Docs; Git can leave it out — see Git settings.) */
+    public static function is_protected($post_id) {
+        return (string) get_post_field('post_password', $post_id) !== '';
     }
 
     public static function is_elementor($post_id) {
@@ -419,9 +430,12 @@ final class Module {
         foreach ($steps as $st) {
             if ($st['kind'] === 'sync' && ($d = $this->dest($st['dest']))) { $d->set_meta($st['id'], 'status', 'Queued'); $d->del_meta($st['id'], 'error'); }
         }
+        // Log heading: scans are "Sync Update" (like the hourly check); bulk pulls "Pull"; everything else "Sync all".
+        $kinds = array_unique(array_column($steps, 'kind'));
+        $log_title = $kinds === ['scan'] ? 'Sync Update' : ($kinds === ['pull'] ? 'Pull' : 'Sync all');
         update_option(self::BATCH_OPTION, ['label' => $label, 'items' => array_values($steps), 'total' => count($steps), 'done' => 0, 'errors' => 0,
-            'started' => time(), 'pause_until' => 0, 'current' => '', 'dest' => $log_dest, 'user' => get_current_user_id()], false);
-        Log::add(count($steps) > 1 || $steps[0]['kind'] === 'scan' ? 'Sync all' : 'Push', $label . ' started (' . count($steps) . ' ' . _n('step', 'steps', count($steps)) . ')', 0, $log_dest);
+            'started' => time(), 'pause_until' => 0, 'current' => '', 'dest' => $log_dest, 'user' => get_current_user_id(), 'log_title' => $log_title], false);
+        Log::add($log_title, $label . ' started (' . count($steps) . ' ' . _n('step', 'steps', count($steps)) . ')', 0, $log_dest);
         delete_option(self::BATCH_LOCK);
         wp_clear_scheduled_hook(self::BATCH_HOOK);
         wp_schedule_single_event(time() + 20, self::BATCH_HOOK);
@@ -543,7 +557,7 @@ final class Module {
         }
         if ($b) {
             $b['items'] = []; $b['finished'] = time(); $b['cancelled'] = true; update_option(self::BATCH_OPTION, $b, false);
-            Log::add('Sync all', sprintf('%s cancelled after %d of %d', $b['label'] ?? 'Job', (int) $b['done'], (int) $b['total']), 0, $b['dest'] ?? '', 'warning');
+            Log::add($b['log_title'] ?? 'Sync all', sprintf('%s cancelled after %d of %d', $b['label'] ?? 'Job', (int) $b['done'], (int) $b['total']), 0, $b['dest'] ?? '', 'warning');
         }
         wp_clear_scheduled_hook(self::BATCH_HOOK);
         delete_option(self::BATCH_LOCK);
@@ -658,8 +672,9 @@ final class Module {
             }
             if (empty($b['items'])) {
                 $b['finished'] = time(); $b['current'] = '';
-                if (!empty($b['stopped'])) Log::add('Sync all', sprintf('%s stopped: the first %d items failed with the same error', $b['label'], (int) $b['done']), 0, $b['dest'] ?? '', 'error', $b['stopped']);
-                else Log::add('Sync all', sprintf('%s complete: %d done, %d failed', $b['label'], (int) $b['done'] - (int) $b['errors'], (int) $b['errors']), 0, $b['dest'] ?? '', $b['errors'] ? 'warning' : 'success');
+                $lt = $b['log_title'] ?? 'Sync all';
+                if (!empty($b['stopped'])) Log::add($lt, sprintf('%s stopped: the first %d items failed with the same error', $b['label'], (int) $b['done']), 0, $b['dest'] ?? '', 'error', $b['stopped']);
+                else Log::add($lt, sprintf('%s complete: %d done, %d failed', $b['label'], (int) $b['done'] - (int) $b['errors'], (int) $b['errors']), 0, $b['dest'] ?? '', $b['errors'] ? 'warning' : 'success');
             }
             update_option(self::BATCH_OPTION, $b, false);
             $n++;

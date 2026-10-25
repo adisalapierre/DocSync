@@ -471,6 +471,8 @@ final class GDocsDestination extends Destination {
         $this->record_wp_baseline($post_id);
         $this->remember_drive_time($post_id, $doc_id);
         delete_transient('mcds_docrev_' . $post_id);
+        update_post_meta($post_id, $this->verified_key(), '1');
+        delete_post_meta($post_id, $this->copied_key());
         do_action('mascamp_docsync_after_run', 'gdocs', $post_id, true);
         return ['warnings' => $warnings];
     }
@@ -550,7 +552,7 @@ final class GDocsDestination extends Destination {
             }
         }
 
-        $items = []; $lookups = 0; $revchecks = 0;
+        $items = []; $lookups = 0; $revchecks = 0; $verifies = 0;
         foreach ($map as $doc_id => $pid) {
             $f = $files[$doc_id] ?? null;
             if (!$f) { // not in the folders (moved, trashed or deleted): look it up directly
@@ -562,6 +564,19 @@ final class GDocsDestination extends Destination {
                 }
                 if (!empty($g['trashed'])) { $items[$pid] = ['state' => 'missing', 'when' => strtotime($g['modifiedTime'] ?? '') ?: 0, 'by' => $g['lastModifyingUser']['displayName'] ?? '', 'detail' => 'The Google Doc is in the Drive trash.', 'url' => $this->view_url($pid)]; continue; }
                 $f = $g;
+            }
+            // One-time check that the doc really holds this post (a duplicated post may have written into it).
+            if (get_post_meta($pid, $this->verified_key(), true) !== '1' && $verifies++ < 100) {
+                $other = $this->doc_holds_other($doc_id, $pid);
+                if ($other === null) { /* couldn't read: try again next scan */ }
+                elseif ($other) {
+                    $items[$pid] = ['state' => 'wrong', 'when' => strtotime($f['modifiedTime'] ?? '') ?: 0, 'by' => '', 'other' => $other,
+                        'detail' => 'This doc holds ' . ($other > 0 ? '“' . Module::plain_title($other) . '” (#' . $other . ')' : 'another post') . ' instead of this ' . get_post_type($pid) . ', written there by a duplicated post. Restore it from WordPress.',
+                        'url' => $this->view_url($pid)];
+                    continue;
+                } else {
+                    update_post_meta($pid, $this->verified_key(), '1');
+                }
             }
             $known = get_post_meta($pid, self::META_DRIVEMOD, true);
             if ($known && ($f['modifiedTime'] ?? '') === $known) continue; // untouched since the last sync
@@ -581,6 +596,32 @@ final class GDocsDestination extends Destination {
         }
         if ($lookups > 60) $note = trim($note . ' Some docs outside the sync folders weren’t checked this time.');
         return ['items' => $items, 'checked' => count($map), 'note' => $note];
+    }
+
+    /**
+     * Reads the doc's "Source: <permalink>" header line (written by every push).
+     * @return int|null 0 = this post's (or no header: imported doc), >0 = other post's ID, -1 = another unknown page, null = couldn't read
+     */
+    private function doc_holds_other($doc_id, $post_id) {
+        $d = $this->api('GET', 'https://docs.googleapis.com/v1/documents/' . rawurlencode($doc_id) . '?fields=body.content(paragraph(elements(textRun(content))))');
+        if (is_wp_error($d)) return null;
+        $n = 0;
+        foreach ($d['body']['content'] ?? [] as $el) {
+            if (!isset($el['paragraph'])) continue;
+            $text = '';
+            foreach ($el['paragraph']['elements'] ?? [] as $e) $text .= $e['textRun']['content'] ?? '';
+            $text = trim($text);
+            if ($text === '') continue;
+            if (++$n > 6) break;
+            if (strpos($text, 'Source:') !== 0) continue;
+            $url = trim(substr($text, 7));
+            $mine = get_permalink($post_id);
+            if (untrailingslashit($url) === untrailingslashit((string) $mine)) return 0;
+            $other = url_to_postid($url);
+            if ($other === (int) $post_id) return 0; // permalink changed since; same post
+            return $other ?: -1;
+        }
+        return 0;
     }
 
     /* ---------------------------------------------------------------- Import new posts from a Drive folder */

@@ -89,13 +89,24 @@ abstract class Destination {
      */
     public function scan_remote(array $post_ids) { return ['items' => [], 'checked' => 0, 'note' => '']; }
 
+    /**
+     * Confirm the remote copy holds THIS post (a duplicated post could have written its own content into it).
+     * @return int 0 = belongs to this post (or can't tell), otherwise the ID of the post whose content it holds (-1 = unknown other post)
+     */
+    public function remote_holds_other($post_id) { return 0; }
+
     /** URL showing the remote copy's change history, or ''. */
     public function history_url($post_id) { return $this->view_url($post_id); }
 
     public function meta($post_id, $key) {
         $value = get_post_meta($post_id, $this->keys()[$key], true);
-        if ($key === 'link' && $value !== '' && $this->link_is_copied((int) $post_id, (string) $value)) {
+        if ($key === 'link' && $value !== '' && ($from = $this->link_is_copied((int) $post_id, (string) $value))) {
             $this->forget_link((int) $post_id);
+            update_post_meta($post_id, $this->copied_key(), $from);
+            if (class_exists(__NAMESPACE__ . '\\Log')) {
+                Log::add('Change detected', 'Duplicate post detected: copied from “' . Module::plain_title($from) . '” (#' . $from . ')', $post_id, $this->id(), 'warning',
+                    'Its copied ' . $this->label() . ' link was removed so it can’t overwrite the original. It gets its own copy on its next sync.');
+            }
             return '';
         }
         return $value;
@@ -120,15 +131,21 @@ abstract class Destination {
      */
 
     private function owner_key() { return '_mascamp_' . $this->id() . '_owner'; }
+    /** Set when a duplicate's copied link was removed: the ID of the post it was copied from. */
+    public function copied_key() { return '_mascamp_' . $this->id() . '_copied_from'; }
+    /** Set when someone chose not to sync this post here (hidden from "Not synced yet"). */
+    public function ignore_key() { return '_mascamp_' . $this->id() . '_ignore'; }
+    /** Set once the remote copy has been checked to really hold this post (not another post's content). */
+    public function verified_key() { return '_mascamp_' . $this->id() . '_verified'; }
 
-    /** true when this post's link was copied from another post. */
+    /** The original post's ID when this post's link was copied from it, otherwise 0. */
     private function link_is_copied($post_id, $value) {
         static $checked = [];
         $ck = $this->id() . ':' . $post_id . ':' . md5($value);
         if (isset($checked[$ck])) return $checked[$ck];
 
         $owner = get_post_meta($post_id, $this->owner_key(), true);
-        if ($owner !== '') return $checked[$ck] = ((int) $owner !== $post_id);
+        if ($owner !== '') return $checked[$ck] = ((int) $owner !== $post_id ? (int) $owner : 0);
 
         // Linked before ownership stamps existed: the lowest-ID live post with this
         // link is the original (a duplicate always gets a higher ID).
@@ -140,10 +157,10 @@ abstract class Destination {
                 AND p.post_status NOT IN ('trash', 'auto-draft', 'inherit')",
             $this->keys()['link'], $value
         ));
-        if ($first && $first !== $post_id) return $checked[$ck] = true;
+        if ($first && $first !== $post_id) return $checked[$ck] = $first;
 
         update_post_meta($post_id, $this->owner_key(), $post_id); // stamp the original
-        return $checked[$ck] = false;
+        return $checked[$ck] = 0;
     }
 
     /** Clear a copied link and everything tied to it. "Keep synced" stays as chosen. */
@@ -153,11 +170,13 @@ abstract class Destination {
         }
         foreach ($this->extra_keys() as $meta_key) delete_post_meta($post_id, $meta_key);
         delete_post_meta($post_id, $this->owner_key());
+        delete_post_meta($post_id, $this->verified_key());
+        delete_post_meta($post_id, $this->wpmod_key());
     }
 
     /** Every meta key this destination writes, for duplicators' "do not copy" lists. */
     public function all_meta_keys() {
-        return array_values(array_merge(array_values($this->keys()), $this->extra_keys(), [$this->owner_key()]));
+        return array_values(array_unique(array_merge(array_values($this->keys()), $this->extra_keys(), [$this->owner_key(), $this->copied_key(), $this->verified_key(), $this->wpmod_key()])));
     }
 
     /** Keeps a saved secret when the field is submitted blank. */

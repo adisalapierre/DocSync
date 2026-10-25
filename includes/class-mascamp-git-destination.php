@@ -257,12 +257,27 @@ final class GitDestination extends Destination {
         if ($tree === null) return ['items' => [], 'checked' => 0, 'note' => 'Bitbucket can’t report edits made directly in the repository, so only WordPress-side Git changes are shown.'];
         if (is_wp_error($tree)) return ['items' => [], 'checked' => 0, 'note' => 'Couldn’t read the repository: ' . $tree->get_error_message()];
 
-        $items = []; $lookups = 0;
+        $items = []; $lookups = 0; $verifies = 0;
         foreach ($paths as $pid => $path) {
             $remote = $tree[$path] ?? null;
             if ($remote === null) {
                 $items[$pid] = ['state' => 'missing', 'when' => 0, 'by' => '', 'detail' => 'The file is missing from the repository (deleted, moved, or the branch changed).', 'url' => $c->history_url($path)];
                 continue;
+            }
+            // One-time check that the file really holds this post (a duplicated post may have written into it).
+            if (get_post_meta($pid, $this->verified_key(), true) !== '1' && $verifies++ < 150) {
+                $file = $c->get_file($path);
+                if (!is_wp_error($file) && $file && $file['content'] !== null) {
+                    $other = preg_match('/^id:\s*(\d+)\s*$/m', substr($file['content'], 0, 2000), $mm) ? (int) $mm[1] : 0;
+                    if ($other && $other !== $pid) {
+                        $items[$pid] = ['state' => 'wrong', 'when' => 0, 'by' => '', 'other' => $other,
+                            'detail' => 'This file holds “' . Module::plain_title($other) . '” (#' . $other . ') instead of this ' . get_post_type($pid) . ', written there by a duplicated post. Restore it from WordPress.',
+                            'url' => $c->web_url($path)];
+                        continue;
+                    }
+                    update_post_meta($pid, $this->verified_key(), '1');
+                    if ((string) get_post_meta($pid, '_mascamp_git_blob', true) === '') update_post_meta($pid, '_mascamp_git_blob', $remote);
+                }
             }
             $known = (string) get_post_meta($pid, '_mascamp_git_blob', true);
             if ($known === '') { update_post_meta($pid, '_mascamp_git_blob', $remote); continue; } // synced before baselines existed

@@ -344,6 +344,9 @@ final class Module {
         $d->set_meta($post_id, 'status', $status);
         $d->set_meta($post_id, 'synced', current_time('mysql'));
         $d->record_wp_baseline($post_id);
+        update_post_meta($post_id, $d->verified_key(), '1');
+        delete_post_meta($post_id, $d->copied_key());
+        delete_post_meta($post_id, $d->ignore_key());
         if ($warnings) $d->set_meta($post_id, 'warn', $warnings); else $d->del_meta($post_id, 'warn');
         $d->del_meta($post_id, 'error');
         return true;

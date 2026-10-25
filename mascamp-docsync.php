@@ -2,13 +2,13 @@
 /**
  * Plugin Name: MasCamp DocSync
  * Description: Two-way Google Docs sync (push, pull, import new posts from Docs) and one-way Git sync (GitHub, GitLab, Bitbucket, Gitea) for chosen WordPress posts and pages.
- * Version: 0.4.1
+ * Version: 0.4.2
  * Author: MasCamp
  * Requires PHP: 7.4
  */
 if (!defined('ABSPATH')) exit;
 
-define('MASCAMP_DOCSYNC_VERSION', '0.4.1');
+define('MASCAMP_DOCSYNC_VERSION', '0.4.2');
 define('MASCAMP_DOCSYNC_DIR', plugin_dir_path(__FILE__));
 
 require_once MASCAMP_DOCSYNC_DIR . 'includes/class-mascamp-gdocs-converter.php';

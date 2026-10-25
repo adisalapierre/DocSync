@@ -93,6 +93,8 @@ Each post's link to its Git file and Google Doc is stamped with that post's ID. 
 | Changed on both sides | Changed on both sides | Keep doc version / Keep WordPress version |
 | Doc deleted or trashed, file deleted or moved | … missing | Recreate from WordPress |
 | Last sync failed | Sync failed (with the error) | Retry sync |
+| Published but never synced: a new post, or a duplicate whose copied link was removed | Not synced yet ("Duplicated from …") | Sync to … / Ignore |
+| The Git file or Google Doc holds a *different* post's content (written by a duplicate before 0.3.1) | Holds another post's content | Restore from WordPress |
 
 - **Sync all WordPress changes** pushes every item that changed *only* in WordPress. Anything edited remotely is never overwritten by this button.
 - **How changes are detected:** WordPress edits are detected immediately. Google Drive and Git are checked hourly, or straight away with **Scan now**. A check uses one Drive folder listing and one repository tree listing. Only docs whose modified time changed get a second, precise revision check, so renames and sharing changes aren't reported as edits.

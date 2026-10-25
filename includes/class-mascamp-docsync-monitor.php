@@ -27,6 +27,8 @@ final class Monitor {
         add_action('admin_post_mascamp_docsync_scan', [$this, 'scan_handler']);
         add_action('admin_post_mascamp_docsync_monitor_dismiss', [$this, 'dismiss_handler']);
         add_action('admin_post_mascamp_docsync_monitor_sync_wp', [$this, 'sync_wp_handler']);
+        add_action('admin_post_mascamp_docsync_monitor_sync_new', [$this, 'sync_new_handler']);
+        add_action('admin_post_mascamp_docsync_monitor_ignore', [$this, 'ignore_handler']);
         add_action('mascamp_docsync_after_run', [$this, 'after_run'], 10, 3);
         add_action('save_post', [$this, 'after_save'], 30, 2);
     }
@@ -52,6 +54,18 @@ final class Monitor {
         ]));
     }
 
+    /** Published posts/pages with no copy in $d yet (not ignored). */
+    private function unsynced_ids(Destination $d) {
+        return array_map('intval', get_posts([
+            'post_type' => Module::TYPES, 'post_status' => 'publish', 'posts_per_page' => -1, 'fields' => 'ids', 'no_found_rows' => true,
+            'meta_query' => [
+                'relation' => 'AND',
+                ['key' => $d->keys()['link'], 'compare' => 'NOT EXISTS'],
+                ['key' => $d->ignore_key(), 'compare' => 'NOT EXISTS'],
+            ],
+        ]));
+    }
+
     /** Posts whose last sync to $d failed. */
     private function error_ids(Destination $d) {
         return array_map('intval', get_posts([
@@ -72,16 +86,26 @@ final class Monitor {
 
     /** Builds the item for one post/destination from its parts; null when everything is in sync. */
     private function build_item(Destination $d, $post_id, $remote, $prev = null) {
-        $wp = $this->wp_side($d, $post_id);
+        $linked = (string) $d->meta($post_id, 'link') !== ''; // also clears a duplicate's copied link
         $error = $d->meta($post_id, 'status') === 'Error' ? (string) $d->meta($post_id, 'error') : '';
-        if ($error === '' && !$wp && !$remote) return null;
+        $new = null;
+        if (!$linked && get_post_status($post_id) === 'publish' && get_post_meta($post_id, $d->ignore_key(), true) !== '1') {
+            $from = (int) get_post_meta($post_id, $d->copied_key(), true);
+            $new = ['from' => $from, 'detail' => $from
+                ? 'Duplicated from “' . Module::plain_title($from) . '”. Needs its own ' . ($d->id() === 'git' ? 'Git file' : 'Google Doc') . '.'
+                : 'Published, but not synced to ' . $d->label() . ' yet.'];
+        }
+        $wp = $linked ? $this->wp_side($d, $post_id) : null;
+        if ($error === '' && !$wp && !$remote && !$new) return null;
         if ($error !== '') $state = 'error';
+        elseif ($remote && $remote['state'] === 'wrong') $state = 'wrong';
+        elseif ($new) $state = 'new';
         elseif ($remote && $remote['state'] === 'missing') $state = 'missing';
         elseif ($wp && $remote) $state = 'both';
         elseif ($wp) $state = 'wp';
         else $state = 'remote';
         return ['post' => (int) $post_id, 'dest' => $d->id(), 'state' => $state, 'wp' => $wp, 'remote' => $remote, 'error' => $error,
-            'found' => $prev['found'] ?? time()];
+            'new' => $new, 'found' => $prev['found'] ?? time()];
     }
 
     /** Full scan: WordPress side + every destination's remote side. */
@@ -116,7 +140,7 @@ final class Monitor {
         if ($remote['note'] !== '') $data['notes'][$id] = $remote['note'];
         $data['checked'][$id] = count($linked);
         $found = 0;
-        foreach (array_unique(array_merge($linked, $this->error_ids($d))) as $pid) {
+        foreach (array_unique(array_merge($linked, $this->error_ids($d), $this->unsynced_ids($d))) as $pid) {
             $key = $id . ':' . $pid;
             $item = $this->build_item($d, $pid, $remote['items'][$pid] ?? null, $prev[$key] ?? null);
             if (!$item) continue;
@@ -149,6 +173,14 @@ final class Monitor {
     /** Log a change the first time it's seen (not on every scan). */
     private function log_new(array $item, $prev) {
         $target = Log::target($item['dest']);
+        if ($item['state'] === 'wrong' && ($prev['state'] ?? '') !== 'wrong') {
+            Log::add('Change detected', $target . ' holds another post’s content', $item['post'], $item['dest'], 'error', $item['remote']['detail'] ?? '');
+            return;
+        }
+        if ($item['state'] === 'new' && ($prev['state'] ?? '') !== 'new') {
+            Log::add('Change detected', 'Post not synced to ' . $target . ' yet', $item['post'], $item['dest'], 'info', $item['new']['detail'] ?? '');
+            return;
+        }
         if ($item['remote'] && empty($prev['remote'])) {
             $r = $item['remote'];
             if ($item['remote']['state'] === 'missing') Log::add('Change detected', $target . ' missing: ' . ($item['dest'] === 'git' ? 'file deleted or moved in the repository' : 'doc deleted or trashed in Drive'), $item['post'], $item['dest'], 'warning', $r['detail'] ?? '');
@@ -171,9 +203,11 @@ final class Monitor {
     /* ---------------------------------------------------------------- Notice */
 
     private function summary(array $items) {
-        $c = ['wp' => 0, 'gdocs' => 0, 'git' => 0, 'error' => 0];
+        $c = ['wp' => 0, 'gdocs' => 0, 'git' => 0, 'error' => 0, 'new' => 0, 'wrong' => 0];
         foreach ($items as $it) {
             if ($it['state'] === 'error') { $c['error']++; continue; }
+            if ($it['state'] === 'new') { $c['new']++; continue; }
+            if ($it['state'] === 'wrong') { $c['wrong']++; continue; }
             if (in_array($it['state'], ['wp', 'both'], true)) $c['wp']++;
             if (in_array($it['state'], ['remote', 'both', 'missing'], true)) $c[$it['dest']]++;
         }
@@ -181,6 +215,8 @@ final class Monitor {
         if ($c['wp']) $parts[] = sprintf(_n('%d edited in WordPress', '%d edited in WordPress', $c['wp']), $c['wp']);
         if ($c['gdocs']) $parts[] = sprintf(_n('%d changed in Google Docs', '%d changed in Google Docs', $c['gdocs']), $c['gdocs']);
         if ($c['git']) $parts[] = sprintf(_n('%d changed in Git', '%d changed in Git', $c['git']), $c['git']);
+        if ($c['wrong']) $parts[] = sprintf(_n('%d holds another post’s content', '%d hold another post’s content', $c['wrong']), $c['wrong']);
+        if ($c['new']) $parts[] = sprintf('%d not synced yet', $c['new']);
         if ($c['error']) $parts[] = sprintf(_n('%d failed sync', '%d failed syncs', $c['error']), $c['error']);
         return $parts;
     }
@@ -235,6 +271,33 @@ final class Monitor {
         if (!$steps) $this->core->notice('success', 'Nothing to sync.');
         elseif (!$this->core->start_job(sprintf('Syncing %d WordPress %s', count($steps), _n('change', 'changes', count($steps))), $steps)) $this->core->notice('error', 'Another DocSync job is running. Try again when it finishes.');
         wp_safe_redirect($this->core->settings_url('changes')); exit;
+    }
+
+    /** Create copies for every post not synced yet, as a background job. */
+    public function sync_new_handler() {
+        if (!current_user_can('manage_options')) wp_die('Forbidden', 403);
+        check_admin_referer('mascamp_docsync_monitor_sync_new');
+        $steps = [];
+        foreach ($this->data()['items'] as $it) {
+            if ($it['state'] === 'new' && get_post_status($it['post']) === 'publish') $steps[] = ['kind' => 'sync', 'dest' => $it['dest'], 'id' => (int) $it['post']];
+        }
+        if (!$steps) $this->core->notice('success', 'Nothing to sync.');
+        elseif (!$this->core->start_job(sprintf('Syncing %d not-yet-synced %s', count($steps), _n('item', 'items', count($steps))), $steps)) $this->core->notice('error', 'Another DocSync job is running. Try again when it finishes.');
+        wp_safe_redirect($this->core->settings_url('changes')); exit;
+    }
+
+    /** Hide a post from "Not synced yet" for one destination (undo: sync it, which clears the flag). */
+    public function ignore_handler() {
+        $dest = sanitize_key($_GET['dest'] ?? '');
+        $post_id = absint($_GET['post'] ?? 0);
+        $d = $this->core->dest($dest);
+        if (!$d || !$post_id || !current_user_can('edit_post', $post_id)) wp_die('Forbidden', 403);
+        check_admin_referer('mascamp_docsync_ignore_' . $dest . '_' . $post_id);
+        update_post_meta($post_id, $d->ignore_key(), '1');
+        $this->refresh_post($post_id);
+        Log::add('Change detected', 'Post set to not sync to ' . Log::target($dest) . ' (ignored)', $post_id, $dest, 'info');
+        $this->core->notice('success', '“' . Module::plain_title($post_id) . '” won’t be listed as not synced to ' . $d->label() . '. Syncing it later turns tracking back on.');
+        wp_safe_redirect(wp_get_referer() ?: $this->core->settings_url('changes')); exit;
     }
 
     /* ---------------------------------------------------------------- Changes tab */
@@ -359,21 +422,27 @@ final class Monitor {
         }
 
         // Summary cards
-        $cards = ['wp' => ['WordPress', 'edited here since last sync'], 'gdocs' => ['Google Docs', 'edited, deleted or trashed in Drive'], 'git' => ['Git', 'changed or missing in the repository'], 'error' => ['Failed syncs', 'need attention']];
-        $count = ['wp' => 0, 'gdocs' => 0, 'git' => 0, 'error' => 0];
+        $cards = ['wp' => ['WordPress', 'edited here since last sync'], 'gdocs' => ['Google Docs', 'edited, deleted or trashed in Drive'], 'git' => ['Git', 'changed or missing in the repository'], 'new' => ['Not synced yet', 'new or duplicated posts'], 'error' => ['Problems', 'failed syncs or wrong content']];
+        $count = ['wp' => 0, 'gdocs' => 0, 'git' => 0, 'new' => 0, 'error' => 0];
         foreach ($items as $it) {
-            if ($it['state'] === 'error') { $count['error']++; continue; }
+            if ($it['state'] === 'error' || $it['state'] === 'wrong') { $count['error']++; continue; }
+            if ($it['state'] === 'new') { $count['new']++; continue; }
             if (in_array($it['state'], ['wp', 'both'], true)) $count['wp']++;
             if (in_array($it['state'], ['remote', 'both', 'missing'], true)) $count[$it['dest']]++;
         }
         echo '<div style="display:flex;flex-wrap:wrap;gap:12px;margin:12px 0 16px">';
         foreach ($cards as $k => $c) {
             $n = $count[$k];
-            echo '<div style="flex:1 1 160px;max-width:240px;background:#fff;border:1px solid #c3c4c7;border-top:3px solid ' . ($n ? ($k === 'error' ? '#d63638' : '#dba617') : '#00a32a') . ';padding:10px 14px">';
+            echo '<div style="flex:1 1 160px;max-width:240px;background:#fff;border:1px solid #c3c4c7;border-top:3px solid ' . ($n ? ($k === 'error' ? '#d63638' : ($k === 'new' ? '#8c8f94' : '#dba617')) : '#00a32a') . ';padding:10px 14px">';
             echo '<div style="font-size:24px;font-weight:600;line-height:1.2">' . (int) $n . '</div><div style="font-weight:600">' . esc_html($c[0]) . '</div><div style="color:#646970;font-size:12px">' . esc_html($n ? $c[1] : 'in sync') . '</div></div>';
         }
         echo '</div>';
 
+        $new_n = count(array_filter($items, static function ($it) { return $it['state'] === 'new'; }));
+        if ($new_n && !$running) {
+            $url = wp_nonce_url(admin_url('admin-post.php?action=mascamp_docsync_monitor_sync_new'), 'mascamp_docsync_monitor_sync_new');
+            echo '<p><a class="button mcds-confirm mcds-run" data-mcds-title="Starting…" data-confirm="' . esc_attr('Create Google Docs / Git files for ' . $new_n . ' post(s) not synced yet?') . '" href="' . esc_url($url) . '">Sync all not-synced-yet (' . (int) $new_n . ')</a> <span style="color:#646970">Or use <em>Ignore</em> on a row for posts you never want synced there.</span></p>';
+        }
         $wp_only = count(array_filter($items, static function ($it) { return $it['state'] === 'wp'; }));
         if ($wp_only && !$running) {
             $url = wp_nonce_url(admin_url('admin-post.php?action=mascamp_docsync_monitor_sync_wp'), 'mascamp_docsync_monitor_sync_wp');
@@ -381,9 +450,9 @@ final class Monitor {
         }
 
         // Filter + table
-        echo '<p><label>Show: <select id="mcds-filter"><option value="">All (' . count($items) . ')</option><option value="wp">Edited in WordPress</option><option value="gdocs">Google Docs</option><option value="git">Git</option><option value="error">Failed syncs</option></select></label></p>';
+        echo '<p><label>Show: <select id="mcds-filter"><option value="">All (' . count($items) . ')</option><option value="wp">Edited in WordPress</option><option value="gdocs">Google Docs</option><option value="git">Git</option><option value="new">Not synced yet</option><option value="error">Problems</option></select></label></p>';
         uasort($items, static function ($a, $b) {
-            $order = ['error' => 0, 'both' => 1, 'missing' => 2, 'remote' => 3, 'wp' => 4];
+            $order = ['wrong' => 0, 'error' => 1, 'both' => 2, 'missing' => 3, 'remote' => 4, 'wp' => 5, 'new' => 6];
             return [$order[$a['state']] ?? 9, -max($a['wp']['when'] ?? 0, $a['remote']['when'] ?? 0)] <=> [$order[$b['state']] ?? 9, -max($b['wp']['when'] ?? 0, $b['remote']['when'] ?? 0)];
         });
         echo '<table class="widefat striped" id="mcds-changes" style="max-width:1200px"><thead><tr><th style="width:24%">Post</th><th style="width:16%">Where</th><th>What changed</th><th style="width:24%;text-align:right">Action</th></tr></thead><tbody>';
@@ -398,6 +467,8 @@ final class Monitor {
                 'remote'  => [$remote_name . ' is newer', '#2271b1'],
                 'both'    => ['Changed on both sides', '#d63638'],
                 'missing' => [$remote_name . ' missing', '#d63638'],
+                'wrong'   => ['Holds another post’s content', '#d63638'],
+                'new'     => ['Not synced yet', '#8c8f94'],
                 'error'   => ['Sync failed', '#d63638'],
             ][$it['state']];
             $what = [];
@@ -409,6 +480,7 @@ final class Monitor {
                 $r = $it['remote'];
                 $what[] = self::line($r['detail'] ?: ($is_docs ? 'Edited in Google Docs' : 'Changed in the repository'), $r) . (!empty($r['url']) ? ' · <a target="_blank" rel="noopener" href="' . esc_url($r['url']) . '">' . ($is_docs ? 'Open doc' : 'View change') . ' ↗</a>' : '');
             }
+            if (!empty($it['new'])) $what[] = esc_html($it['new']['detail']) . (!empty($it['new']['from']) ? ' · <a href="' . esc_url(get_edit_post_link($it['new']['from'], 'url')) . '">original</a>' : '');
             if ($it['error'] !== '') $what[] = '<span style="color:#b32d2e">' . esc_html($it['error']) . '</span>';
             if ($it['state'] === 'both') $what[] = '<em style="color:#b32d2e">Pick one version: the other side’s edits will be replaced' . ($is_docs ? ' (WordPress keeps the old version in Revisions; the doc keeps it in Version history)' : '') . '.</em>';
 
@@ -433,12 +505,19 @@ final class Monitor {
                     }
                     $actions[] = '<a class="button mcds-confirm mcds-run"' . $run . ' data-confirm="' . esc_attr('Keep the WordPress version? The ' . $remote_name . '’s edits will be overwritten.') . '" href="' . esc_url($this->core->sync_url($it['dest'], $pid, true)) . '">Keep WordPress version</a>';
                     break;
+                case 'wrong':
+                    if ($published) $actions[] = '<a class="button button-primary mcds-confirm mcds-run"' . $run . ' data-confirm="' . esc_attr('Replace the ' . $remote_name . ' with “' . Module::plain_title($pid) . '” from WordPress? The other post’s content in it is removed (it stays in the ' . ($is_docs ? 'doc’s Version history' : 'repository history') . ').') . '" href="' . esc_url($this->core->sync_url($it['dest'], $pid, true)) . '">Restore from WordPress</a>';
+                    break;
+                case 'new':
+                    $actions[] = '<a class="button button-primary mcds-run"' . $run . ' href="' . esc_url($sync) . '">Sync to ' . esc_html($d->label()) . '</a>';
+                    $actions[] = '<a class="button-link" style="margin-left:6px" title="Don’t list this post as not synced to ' . esc_attr($d->label()) . '" href="' . esc_url(wp_nonce_url(admin_url('admin-post.php?action=mascamp_docsync_monitor_ignore&dest=' . $it['dest'] . '&post=' . $pid), 'mascamp_docsync_ignore_' . $it['dest'] . '_' . $pid)) . '">Ignore</a>';
+                    break;
                 case 'missing':
                 case 'error':
                     if ($published) $actions[] = '<a class="button button-primary mcds-run"' . $run . ' href="' . esc_url($this->core->sync_url($it['dest'], $pid, $it['state'] === 'missing')) . '">' . ($it['state'] === 'missing' ? 'Recreate from WordPress' : 'Retry sync') . '</a>';
                     break;
             }
-            $filter = $it['state'] === 'error' ? 'error' : trim((in_array($it['state'], ['wp', 'both'], true) ? 'wp ' : '') . (in_array($it['state'], ['remote', 'both', 'missing'], true) ? $it['dest'] : ''));
+            $filter = in_array($it['state'], ['error', 'wrong'], true) ? 'error ' . $it['dest'] : ($it['state'] === 'new' ? 'new ' . $it['dest'] : trim((in_array($it['state'], ['wp', 'both'], true) ? 'wp ' : '') . (in_array($it['state'], ['remote', 'both', 'missing'], true) ? $it['dest'] : '')));
             echo '<tr data-filter="' . esc_attr($filter) . '">';
             echo '<td><a href="' . esc_url(get_edit_post_link($pid, 'url')) . '"><strong>' . esc_html(Module::plain_title($pid)) . '</strong></a><br><small style="color:#646970">' . esc_html(ucfirst(get_post_type($pid))) . (get_post_status($pid) !== 'publish' ? ' · ' . esc_html(get_post_status($pid)) : '') . ' · <a href="' . esc_url(add_query_arg(['post_id' => $pid], $this->core->settings_url('changes'))) . '#mcds-log">activity history</a></small></td>';
             echo '<td><strong>' . esc_html($d->label()) . '</strong><br><span style="display:inline-block;margin-top:3px;padding:1px 8px;border-radius:10px;font-size:11px;color:#fff;background:' . esc_attr($badge[1]) . '">' . esc_html($badge[0]) . '</span></td>';

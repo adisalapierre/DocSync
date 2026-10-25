@@ -24,6 +24,8 @@ final class GitDestination extends Destination {
         ];
     }
 
+    public function extra_keys() { return ['_mascamp_git_url']; }
+
     public function hooks() {
         add_action('admin_post_mascamp_docsync_git_test', [$this, 'test_connection']);
     }

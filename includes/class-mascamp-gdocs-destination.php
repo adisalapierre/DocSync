@@ -28,6 +28,10 @@ final class GDocsDestination extends Destination {
         ];
     }
 
+    public function extra_keys() {
+        return [self::META_REV, self::META_WPMOD, self::META_FEATURED, self::META_IMPORTED, '_mascamp_gdocs_source_url'];
+    }
+
     public function hooks() {
         add_action('admin_post_mascamp_gdocs_connect', [$this, 'connect']);
         add_action('admin_post_mascamp_gdocs_callback', [$this, 'oauth_callback']);

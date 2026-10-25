@@ -75,6 +75,9 @@ define('MASCAMP_DOCSYNC_GIT_TOKEN', 'your-token');
 - Each changed item is one commit, with a message such as `Update post: Band Launch 2027`. If nothing changed, no commit is made and the status shows *Up to date*.
 - **Images are referenced by their website URL only.** Image files are never copied into the repository.
 
+## Duplicated posts
+Each post's link to its Git file and Google Doc is stamped with that post's ID. Duplicator plugins copy every custom field, so a duplicate arrives carrying the original's link. DocSync detects this (the stamp names another post) and clears the copied sync data, so the duplicate gets its own file and its own doc on its first sync and never overwrites the original's. *Keep synced* choices are kept. Posts linked before this check existed are handled too: the lowest-ID post with a given link is treated as the original. With Yoast Duplicate Post, DocSync's fields are also excluded from copying.
+
 ## Notes and limitations
 - Elementor pages are synced from their rendered content. Page-builder layout (columns, spacing, backgrounds) is not kept: content comes through stacked in page order.
 - Only published posts and pages sync, and each sync copies the last *saved* version.

@@ -30,6 +30,11 @@ final class Module {
         $this->dests = ['gdocs' => new GDocsDestination($this), 'git' => new GitDestination($this)];
         foreach ($this->dests as $d) $d->hooks();
 
+        // Yoast Duplicate Post: don't copy sync data onto duplicates (the ownership check
+        // in Destination catches copies made by any other duplicator).
+        add_filter('duplicate_post_excludelist_filter', [$this, 'exclude_from_duplicates']);
+        add_filter('duplicate_post_blacklist_filter', [$this, 'exclude_from_duplicates']);
+
         add_action('admin_menu', [$this, 'admin_menu']);
         add_action('admin_init', [$this, 'register_settings']);
         add_action('admin_post_mascamp_docsync_now', [$this, 'sync_now']);
@@ -56,6 +61,13 @@ final class Module {
 
     /** @return Destination|null */
     public function dest($id) { return $this->dests[$id] ?? null; }
+
+    /** Meta keys a duplicated post must not inherit. */
+    public function exclude_from_duplicates($keys) {
+        $keys = is_array($keys) ? $keys : [];
+        foreach ($this->dests as $d) $keys = array_merge($keys, $d->all_meta_keys());
+        return array_values(array_unique($keys));
+    }
     /** @return Destination[] configured destinations */
     private function ready_dests() { return array_filter($this->dests, static function ($d) { return $d->is_ready(); }); }
 

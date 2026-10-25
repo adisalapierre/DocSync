@@ -25,6 +25,8 @@ final class Module {
     private $dests = [];
     /** @var Monitor */
     public $monitor;
+    /** @var Deploy */
+    public $deploy;
 
     public static function instance() { return self::$instance ?: (self::$instance = new self()); }
 
@@ -33,6 +35,7 @@ final class Module {
         Log::install();
         foreach ($this->dests as $d) $d->hooks();
         $this->monitor = new Monitor($this);
+        $this->deploy = new Deploy($this);
 
         // Yoast Duplicate Post: don't copy sync data onto duplicates (the ownership check
         // in Destination catches copies made by any other duplicator).
@@ -97,6 +100,8 @@ final class Module {
         foreach ($this->dests as $d) foreach ($d->tabs() as $slug => $label) { $tabs[$slug] = $label; $extra[$slug] = $d; }
         $n = $this->monitor->count();
         $tabs = ['changes' => 'Changes' . ($n ? ' <span class="awaiting-mod" style="display:inline-block;min-width:18px;padding:0 5px;border-radius:9px;background:#d63638;color:#fff;font-size:11px;line-height:18px;text-align:center">' . $n . '</span>' : '')] + $tabs;
+        $deployTabs = $this->deploy->tabs();
+        $tabs += $deployTabs;
         $tabs += ['all' => 'Sync all', 'help' => 'How it works'];
         $tab = sanitize_key($_GET['tab'] ?? 'gdocs');
         if (!isset($tabs[$tab])) $tab = 'gdocs';
@@ -112,6 +117,7 @@ final class Module {
         if ($tab === 'changes') $this->monitor->render_tab();
         elseif (isset($this->dests[$tab])) $this->dests[$tab]->render_settings();
         elseif (isset($extra[$tab])) $extra[$tab]->render_tab($tab);
+        elseif (isset($deployTabs[$tab])) $this->deploy->render_tab($tab);
         elseif ($tab === 'all') $this->render_batch_section();
         else $this->render_help();
         echo '</div>';
@@ -432,7 +438,7 @@ final class Module {
         }
         // Log heading: scans are "Sync Update" (like the hourly check); bulk pulls "Pull"; everything else "Sync all".
         $kinds = array_unique(array_column($steps, 'kind'));
-        $log_title = $kinds === ['scan'] ? 'Sync Update' : ($kinds === ['pull'] ? 'Pull' : 'Sync all');
+        $log_title = $kinds === ['scan'] ? 'Sync Update' : ($kinds === ['pull'] ? 'Pull' : ($kinds === ['deploy'] ? 'Deploy' : 'Sync all'));
         update_option(self::BATCH_OPTION, ['label' => $label, 'items' => array_values($steps), 'total' => count($steps), 'done' => 0, 'errors' => 0,
             'started' => time(), 'pause_until' => 0, 'current' => '', 'dest' => $log_dest, 'user' => get_current_user_id(), 'log_title' => $log_title], false);
         Log::add($log_title, $label . ' started (' . count($steps) . ' ' . _n('step', 'steps', count($steps)) . ')', 0, $log_dest);
@@ -589,6 +595,7 @@ final class Module {
     private function step_label(array $st) {
         if ($st['kind'] === 'scan') return 'Checking ' . ($st['dest'] === 'git' ? 'Git repository' : 'Google Drive') . ' for changes…';
         if ($st['kind'] === 'pull') return '“' . self::plain_title($st['id']) . '” ← Google Docs';
+        if ($st['kind'] === 'deploy') return 'Deploying ' . str_replace(':', ' “', (string) $st['key']) . '” from Git';
         $d = $this->dest($st['dest']);
         return '“' . self::plain_title($st['id']) . '” → ' . ($d ? $d->label() : $st['dest']);
     }
@@ -629,6 +636,9 @@ final class Module {
             if ($st['kind'] === 'scan') {
                 $found = $this->monitor->scan_dest($st['dest']);
                 $result = is_wp_error($found) ? $found : true;
+            } elseif ($st['kind'] === 'deploy') {
+                $r = $this->deploy->deploy((string) $st['key'], 'Deploy all updates');
+                $result = is_wp_error($r) ? $r : true;
             } elseif ($st['kind'] === 'pull') {
                 $d = $this->dest('gdocs');
                 $r = ($d && method_exists($d, 'pull')) ? $d->pull((int) $st['id']) : new \WP_Error('no_pull', 'Pull isn’t available.');
@@ -656,8 +666,8 @@ final class Module {
             if ($result !== true) {
                 $b['errors'] = (int) $b['errors'] + 1;
                 $b['failures'] = array_slice(array_merge((array) ($b['failures'] ?? []), [[
-                    'id' => $st['kind'] !== 'scan' ? (int) $st['id'] : 0,
-                    'title' => $st['kind'] !== 'scan' ? self::plain_title($st['id']) : $this->step_label($st),
+                    'id' => in_array($st['kind'], ['sync', 'pull'], true) ? (int) $st['id'] : 0,
+                    'title' => in_array($st['kind'], ['sync', 'pull'], true) ? self::plain_title($st['id']) : $this->step_label($st),
                     'error' => is_wp_error($result) ? $result->get_error_message() : 'Unknown error',
                 ]]), -100);
                 // The first few all failed the same way: it's a setup problem, so stop instead of failing every post.
@@ -687,7 +697,7 @@ final class Module {
     public function job_notice() {
         if (!current_user_can('manage_options') || !$this->batch_running()) return;
         $page = $_GET['page'] ?? ''; $tab = $_GET['tab'] ?? 'gdocs';
-        if ($page === self::PAGE && in_array($tab, ['changes', 'all'], true)) return; // full panel is shown there
+        if ($page === self::PAGE && in_array($tab, ['changes', 'all', 'plugins', 'themes'], true)) return; // full panel is shown there
         $this->render_progress(true);
     }
 

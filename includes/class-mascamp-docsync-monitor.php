@@ -393,11 +393,11 @@ final class Monitor {
         echo '<h2 id="mcds-log" style="margin-top:32px">Activity log</h2>';
         echo '<form method="get" style="margin:0 0 10px;display:flex;flex-wrap:wrap;gap:10px;align-items:center"><input type="hidden" name="page" value="' . esc_attr(Module::PAGE) . '"><input type="hidden" name="tab" value="changes">';
         echo '<label>Activity type <select name="log">';
-        $types = ['' => 'All activities', 'Push' => 'Push', 'Pull' => 'Pull', 'Update' => 'Update', 'Sync Update' => 'Sync Update (scans)', 'Change detected' => 'Change detected', 'Import' => 'Import', 'Sync all' => 'Sync all', 'error' => 'Errors'];
+        $types = ['' => 'All activities', 'Push' => 'Push', 'Pull' => 'Pull', 'Update' => 'Update', 'Sync Update' => 'Sync Update (scans)', 'Change detected' => 'Change detected', 'Import' => 'Import', 'Sync all' => 'Sync all', 'Deploy' => 'Deploy (plugins & themes)', 'error' => 'Errors'];
         foreach ($types as $v => $l) echo '<option value="' . esc_attr($v) . '" ' . selected($type, $v, false) . '>' . esc_html($l) . '</option>';
         echo '</select></label>';
         echo '<label>Location <select name="where">';
-        foreach (['' => 'All locations', 'gdocs' => 'Google Docs', 'git' => 'Git'] as $v => $l) echo '<option value="' . esc_attr($v) . '" ' . selected($dest, $v, false) . '>' . esc_html($l) . '</option>';
+        foreach (['' => 'All locations', 'gdocs' => 'Google Docs', 'git' => 'Git', 'deploy' => 'Plugins & themes'] as $v => $l) echo '<option value="' . esc_attr($v) . '" ' . selected($dest, $v, false) . '>' . esc_html($l) . '</option>';
         echo '</select></label>';
         echo '<label><input type="checkbox" name="issues" value="1" ' . checked($issues, true, false) . '> Only posts with sync issues (' . count($issue_ids) . ')</label>';
         if ($post) echo '<input type="hidden" name="post_id" value="' . (int) $post . '">';
@@ -432,7 +432,7 @@ final class Monitor {
             } elseif ($r->post_id) {
                 echo '<div style="color:#646970">Post #' . (int) $r->post_id . ' (deleted)</div>';
             }
-            if ($r->dest) echo '<div style="color:#646970">' . esc_html($r->dest === 'git' ? 'Git' : 'Google Docs') . '</div>';
+            if ($r->dest) echo '<div style="color:#646970">' . esc_html(['git' => 'Git', 'deploy' => 'Plugins & themes'][$r->dest] ?? 'Google Docs') . '</div>';
             echo '<div style="color:#646970">By: ' . esc_html($who) . '</div>';
             if ($r->detail !== null && $r->detail !== '') echo '<div style="margin-top:4px;' . ($r->status === 'error' ? 'color:#b32d2e' : 'color:#50575e') . '">' . esc_html(wp_trim_words($r->detail, 40)) . '</div>';
             echo '</td></tr>';

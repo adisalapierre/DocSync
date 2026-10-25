@@ -71,7 +71,7 @@ final class Log {
         $where = '1=1'; $args = [];
         if ($f['type'] === 'error') { $where .= ' AND status = %s'; $args[] = 'error'; }
         elseif ($f['type'] !== '') { $where .= ' AND title = %s'; $args[] = $f['type']; }
-        if (in_array($f['dest'], ['gdocs', 'git'], true)) { $where .= ' AND dest = %s'; $args[] = $f['dest']; }
+        if (in_array($f['dest'], ['gdocs', 'git', 'deploy'], true)) { $where .= ' AND dest = %s'; $args[] = $f['dest']; }
         if (is_array($f['post_ids'])) {
             $ids = array_values(array_filter(array_map('intval', $f['post_ids'])));
             if (!$ids) return ['rows' => [], 'total' => 0];
@@ -92,5 +92,5 @@ final class Log {
     }
 
     /** "Post to Git" / "Post to Google Doc" wording per destination. */
-    public static function target($dest) { return $dest === 'git' ? 'Git' : 'Google Doc'; }
+    public static function target($dest) { return $dest === 'git' ? 'Git' : ($dest === 'deploy' ? 'Plugins & themes' : 'Google Doc'); }
 }

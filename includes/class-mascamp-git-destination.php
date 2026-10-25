@@ -42,6 +42,12 @@ final class GitDestination extends Destination {
         return $this->settings()['token'];
     }
 
+    /** The Git tab's provider, token and username (re-used by Plugin/Theme Sync when chosen). */
+    public function credentials() {
+        $s = $this->settings();
+        return ['provider' => $s['provider'], 'token' => (string) $this->token(), 'username' => $s['provider'] === 'bitbucket' ? $s['username'] : ''];
+    }
+
     /** @return GitClient|\WP_Error */
     private function client() {
         $s = $this->settings();

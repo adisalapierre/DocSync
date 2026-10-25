@@ -1,11 +1,12 @@
 # MasCamp DocSync
 
-**Version 0.4.4** · WordPress plugin · PHP 7.4+
+**Version 0.5.0** · WordPress plugin · PHP 7.4+
 
-MasCamp DocSync keeps chosen WordPress posts and pages in sync with **Google Docs** and with a **Git repository** (GitHub, GitLab, Bitbucket Cloud or Gitea).
+MasCamp DocSync keeps chosen WordPress posts and pages in sync with **Google Docs** and with a **Git repository** (GitHub, GitLab, Bitbucket Cloud or Gitea), and installs and updates **plugins and themes straight from Git**.
 
 - **Google Docs is two-way.** Push a post to its own Google Doc, pull edits made in the doc back into WordPress, or write a brand-new post as a doc and import it as a draft.
 - **Git is one-way.** Each post is committed as a Markdown file with its details at the top. The repository becomes a version-controlled archive of your content.
+- **Plugin & Theme Sync deploys code from Git.** Connect a plugin or theme to a repository branch and choose how it updates: *Manual*, *Check & notify*, or *Automatic* on every push. It replaces Deployer for Git, and can import its connections.
 - **A Sync Monitor watches all three places** (WordPress, Google Drive and Git). It shows what is out of sync, who changed it and when, with a one-click fix for each case. Every action is recorded in an activity log.
 
 Nothing syncs unless you choose it.
@@ -19,15 +20,16 @@ Nothing syncs unless you choose it.
 4. [Google Docs](#google-docs)
 5. [Git](#git)
 6. [Changes: the Sync Monitor](#changes-the-sync-monitor)
-7. [Activity log](#activity-log)
-8. [Background jobs and progress](#background-jobs-and-progress)
-9. [Duplicated posts](#duplicated-posts)
-10. [Content handling](#content-handling)
-11. [Security and data stored](#security-and-data-stored)
-12. [Troubleshooting](#troubleshooting)
-13. [Development workflow](#development-workflow)
-14. [File structure](#file-structure)
-15. [Changelog](#changelog)
+7. [Plugin & Theme Sync](#plugin--theme-sync)
+8. [Activity log](#activity-log)
+9. [Background jobs and progress](#background-jobs-and-progress)
+10. [Duplicated posts](#duplicated-posts)
+11. [Content handling](#content-handling)
+12. [Security and data stored](#security-and-data-stored)
+13. [Troubleshooting](#troubleshooting)
+14. [Development workflow](#development-workflow)
+15. [File structure](#file-structure)
+16. [Changelog](#changelog)
 
 ---
 
@@ -54,6 +56,7 @@ After activating, set up Google Docs and/or Git on their tabs. Then open **Chang
 | **… → Google Docs** | OAuth connection, Drive folders, image mode, automatic sync |
 | **… → Git** | Provider, repository URL, branch, folder, token, **Test connection** |
 | **… → Import from Docs** | Turn docs in the import folder into draft posts or pages |
+| **… → Plugin Sync / Theme Sync** | Connect plugins and themes to Git, deploy updates, Push-to-Deploy URLs, deploy settings |
 | **… → Sync all** | Sync every published post or page to a destination |
 | **… → How it works** | Short in-app guide |
 | **Post editor → DocSync box** | Per-post status, **Sync now**, **Pull from Google Doc**, **Keep synced** |
@@ -179,6 +182,68 @@ Shortcut buttons: **Sync all WordPress changes** (only items changed in WordPres
 
 ---
 
+## Plugin & Theme Sync
+
+**Settings → MasCamp DocSync → Plugin Sync** and **Theme Sync.** Install and update plugins and themes from a Git branch on GitHub, GitLab, Bitbucket or Gitea. Git doesn't need to be installed on the server.
+
+### Connecting a plugin or theme
+Click **Connect a plugin from Git** (or **theme**) and fill in:
+- **Plugin / Theme:** an installed one to manage from Git, or **New: install from the repository** (with an optional folder name; by default the repository's name).
+- **Provider Type**, **Repository URL** and **Branch**, e.g. `main` for clients that get every release, or a release branch for legacy clients.
+- **Folder in repository:** only if the plugin or theme lives in a subfolder of the repository.
+- **Access:**
+  - *Public repository*: no token.
+  - *Use the token from the Git tab*: the same provider only.
+  - *Private: use this token*: for GitHub, a fine-grained token with **Contents: Read** is enough. Bitbucket also takes a username/email for app passwords and API tokens.
+- **Updates:** choose one mode per package:
+
+  | Mode | What happens |
+  |---|---|
+  | **Manual** | Only when you click **Deploy**. Good for legacy clients on older code. |
+  | **Check & notify** | Checked hourly, and whenever a push arrives. Shows **Update available** (commit, message, author) and an admin notice; you deploy when ready. |
+  | **Automatic** | Deploys on every push to the branch through the **Push-to-Deploy URL**. The hourly check catches any missed push. For sites that should always run the latest, e.g. client sites on `main`. |
+- **Keep on deploy:** files or folders the site creates inside the plugin or theme that aren't in Git (e.g. `config.php`, `cache/`). They're copied into each new version.
+- **Activate after the first install** (plugins).
+
+### The cards
+Each connected package shows its name, folder, provider, branch, repository, update mode, the installed commit and the latest commit on the branch, plus a status:
+- **Up to date**
+- **Update available**
+- **Not installed**
+- **Version unknown**: not deployed by DocSync yet; deploy once to start tracking.
+- **Local git clone**
+- **Error**
+
+Buttons: **Install / Deploy now / Update to …**, **Check**, **Edit**, **Disconnect** (leaves the files in place), and **Show Push-to-Deploy URL**. At the top of the tab, **Check all for updates** and **Deploy all updates** run as a background job with a progress bar.
+
+### Push-to-Deploy (webhooks)
+Each package has a URL like `https://example.com/wp-json/mascamp-docsync/v1/deploy?type=plugin&package=<folder>&secret=…`. Add it as a **push** webhook in the repository. On GitHub: *Settings → Webhooks → Add webhook*, content type `application/json`.
+- **Only pushes to the package's branch count.** Pushes to other branches and tags are ignored.
+- **Automatic** packages deploy right after the push, in the background. **Manual** and **Check & notify** packages just record the update.
+- **Authentication:** the URL's `secret`, or the same secret set as the webhook's *Secret* (GitHub/Gitea signature, GitLab token).
+- **CI:** add `&sync=1` to wait for the deploy result.
+
+### Safety
+- **Wrong repository:** the download must contain a plugin (a PHP file with `Plugin Name:`) or a theme (`style.css` with `Theme Name:`). If it doesn't, nothing on the site is changed.
+- **Local git clones** (folders with `.git`, like a MAMP development copy) are never overwritten. Update them with `git pull`.
+- **Swapping in the new version:** it's prepared next to the old one and swapped in with folder renames, so a failed deploy leaves the previous version in place. PHP's opcode cache is refreshed for the new files.
+- **Disabled file changes:** deploys are refused when file changes are disabled (`DISALLOW_FILE_MODS`) or WordPress can't write to the folder directly.
+- **No backups:** DocSync doesn't keep backups of previous versions. Git history is the record; redeploy an older branch or commit to roll back.
+
+### Deploy settings
+At the bottom of either tab:
+- **Push-to-Deploy secret**, with **Regenerate**. Regenerating changes every webhook URL.
+- **Flush cache** after every deploy: WP Rocket, WP-Optimize, W3 Total Cache, LiteSpeed Cache, WP Super Cache, WP Fastest Cache and Autoptimize; detected plugins are shown.
+- **Alert notification:** a wp-admin banner reminding developers not to edit connected plugins or themes on the site, but to use Git.
+
+### Switching from Deployer for Git
+When Deployer for Git's data is on the site, **Import N package(s)** copies each plugin and theme connection (repository, branch, token). Its own data is left untouched.
+- Imported packages start in **Check & notify**. Switch the ones that should update on every push to **Automatic**.
+- Click **Deploy** once on each, to start tracking its version.
+- After you deactivate Deployer for Git, its existing Push-to-Deploy URLs (`/wp-json/dfg/v1/package_update?…`) keep working, handled by DocSync with the imported secret. You don't need to change any repository webhooks.
+
+---
+
 ## Activity log
 
 Shown below the list on the *Changes* tab. Each event has a heading, an event type and a time:
@@ -197,9 +262,10 @@ Time: October 25, 2026 1:22:03 pm
 | **Sync Update** | A scan of Google Drive / Git started or finished |
 | **Change detected** | Something went out of sync: WordPress edit, remote edit, duplicate, wrong content, not synced yet |
 | **Sync all** | A bulk job started, finished, stopped or was cancelled |
+| **Deploy** | A plugin or theme was connected, deployed from Git, queued by a push, or disconnected |
 | **Error** | A sync or pull failed, with the reason |
 
-**Filters:** *Activity type*, *Location* (Google Docs or Git) and **Only posts with sync issues**. They can be combined. Each post's **activity history** link shows only that post's events. Entries show who did it, or *Automatic* for scheduled runs. Events are kept for **90 days**.
+**Filters:** *Activity type*, *Location* (Google Docs, Git, or Plugins & themes) and **Only posts with sync issues**. They can be combined. Each post's **activity history** link shows only that post's events. Entries show who did it, or *Automatic* for scheduled runs. Events are kept for **90 days**.
 
 ---
 
@@ -241,11 +307,12 @@ Duplicator plugins copy every custom field, including the link to the original's
 - Only administrators can change settings, run bulk jobs or scans, and see the monitor. Per-post actions require permission to edit that post. Every action is nonce-protected.
 - **Secrets:** the Google client secret and the Git token can be kept out of the database with `MASCAMP_GDOCS_CLIENT_SECRET` and `MASCAMP_DOCSYNC_GIT_TOKEN` in `wp-config.php`. Google OAuth tokens are stored in the options table.
 - **Google access:** the `documents` and `drive` scopes, needed to write into a folder you created yourself.
+- **Deployments** need permission to install plugins and themes. Webhooks require the secret or a valid signature.
 - **Data stored:**
-  - **Options:** `mascamp_docsync_settings`, `mascamp_docsync_tokens`, `mascamp_docsync_git`, `mascamp_docsync_batch`, `mascamp_docsync_monitor`.
+  - **Options:** `mascamp_docsync_settings`, `mascamp_docsync_tokens`, `mascamp_docsync_git`, `mascamp_docsync_batch`, `mascamp_docsync_monitor`, `mascamp_docsync_packages` (plugin and theme connections, including tokens), `mascamp_docsync_deploy`.
   - **Post meta:** keys beginning `_mascamp_gdocs_`, `_mascamp_docsync_` and `_mascamp_git_`, holding links, status, baselines and flags.
   - **Activity log:** the database table `wp_mascamp_docsync_log`.
-- **Scheduled tasks:** the hourly `mascamp_docsync_monitor_scan`, cleared on deactivation, plus short-lived job and queue events.
+- **Scheduled tasks:** the hourly `mascamp_docsync_monitor_scan` and `mascamp_docsync_deploy_check` (only while a package uses Check & notify or Automatic), both cleared on deactivation, plus short-lived job, queue and deploy events.
 
 ---
 
@@ -264,6 +331,10 @@ Duplicator plugins copy every custom field, including the link to the original's
 | "Image skipped" warning | Google couldn't fetch the image (WebP, protected or localhost URL). Use JPG/PNG/GIF on a public URL, or switch to *Link to images only*. |
 | A job seems stuck | Keep an admin page open, or make sure WP-Cron runs (site traffic or a server cron calling `wp-cron.php`). Cancel and restart if needed. |
 | "Sync all stopped: the first N items failed with the same error" | Fix the setting it names (usually the token), use **Test connection**, then run it again. |
+| Deploy: "isn't a plugin" / "isn't a theme" | Check the branch and *Folder in repository*: the plugin's main PHP file (or the theme's `style.css`) must be at that level. |
+| Deploy: "This folder is a local git clone" | Expected on a development copy: update it with `git pull`. |
+| Deploy: "wasn't a zip file" / 404 | The token can't read the repository, or the branch doesn't exist. Use a token with read access to contents. |
+| Push-to-Deploy does nothing | The package must be in **Automatic** mode, the push must be to its branch, and WP-Cron must run. Check the Activity log for "push received". |
 
 ---
 
@@ -296,12 +367,20 @@ mascamp-docsync/
     ├── class-mascamp-docs-importer.php      Google Doc → WordPress blocks
     ├── class-mascamp-git-destination.php    Git settings, Markdown file builder, repository scan
     ├── class-mascamp-git-client.php         GitHub / GitLab / Bitbucket / Gitea REST client
+    │                                        (files, commits, archives)
+    ├── class-mascamp-deploy.php             Plugin & Theme Sync: deploys, checks, webhooks, import
     └── class-mascamp-markdown-converter.php HTML → Markdown
 ```
 
 ---
 
 ## Changelog
+
+**0.5.0**
+- **Plugin Sync** and **Theme Sync** tabs: install and update plugins and themes from GitHub, GitLab, Bitbucket or Gitea.
+- Each package has its own update mode (Manual / Check & notify / Automatic), a Push-to-Deploy webhook, Keep-on-deploy files, safety checks and a folder-swap install.
+- Deploy settings: secret, cache flushing and a developer alert banner.
+- Import from Deployer for Git, with its old webhook URLs kept working.
 
 **0.4.4**
 - Password-protected posts sync their real content and title. Git leaves protected content out unless enabled.

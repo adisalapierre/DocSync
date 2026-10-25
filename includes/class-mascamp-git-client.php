@@ -13,9 +13,9 @@ final class GitClient {
     private $provider, $scheme, $host, $path, $owner, $repo, $branch, $token, $username, $api;
 
     /** @return GitClient|\WP_Error */
-    public static function create($provider, $repo_url, $branch, $token, $username = '') {
+    public static function create($provider, $repo_url, $branch, $token, $username = '', $allow_public = false) {
         if (!isset(self::PROVIDERS[$provider])) return new \WP_Error('git_provider', 'Choose a Git provider type.');
-        if (trim((string) $token) === '') return new \WP_Error('git_token', 'Add an access token for the repository.');
+        if (trim((string) $token) === '' && !$allow_public) return new \WP_Error('git_token', 'Add an access token for the repository.');
         $p = self::parse_repo_url($provider, $repo_url);
         if (is_wp_error($p)) return $p;
         $c = new self();
@@ -70,6 +70,9 @@ final class GitClient {
     /* ---------------------------------------------------------------- HTTP */
 
     private function headers() {
+        if ($this->token === '') { // public repository: no credentials
+            return $this->provider === 'github' ? ['Accept' => 'application/vnd.github+json', 'X-GitHub-Api-Version' => '2022-11-28'] : ['Accept' => 'application/json'];
+        }
         switch ($this->provider) {
             case 'github': return ['Authorization' => 'Bearer ' . $this->token, 'Accept' => 'application/vnd.github+json', 'X-GitHub-Api-Version' => '2022-11-28'];
             case 'gitlab': return ['PRIVATE-TOKEN' => $this->token];
@@ -313,4 +316,90 @@ final class GitClient {
     }
 
     public function provider() { return $this->provider; }
+
+    /* ---------------------------------------------------------------- Deployments (plugins & themes) */
+
+    /** Browser address of the repository. */
+    public function repo_web_url() { return ($this->provider === 'bitbucket' ? 'https://bitbucket.org' : $this->scheme . '://' . $this->host) . '/' . $this->path; }
+
+    public function provider_label() { return self::PROVIDERS[$this->provider] ?? $this->provider; }
+
+    /**
+     * Latest commit on the branch.
+     * @return array{sha:string,message:string,by:string,date:int,url:string}|\WP_Error
+     */
+    public function head_commit() {
+        $b = rawurlencode($this->branch);
+        switch ($this->provider) {
+            case 'github':    $r = $this->request('GET', $this->repo_base() . '/commits/' . $b); break;
+            case 'gitlab':    $r = $this->request('GET', $this->repo_base() . '/repository/branches/' . $b); break;
+            case 'gitea':     $r = $this->request('GET', $this->repo_base() . '/branches/' . $b); break;
+            case 'bitbucket': $r = $this->request('GET', $this->repo_base() . '/refs/branches/' . $b); break;
+            default: return new \WP_Error('git_provider', 'Unsupported provider.');
+        }
+        if (is_wp_error($r)) return $r;
+        if ($r['code'] === 404) return new \WP_Error('git_branch', 'Branch “' . $this->branch . '” wasn’t found in ' . $this->path . ', or the token can’t see this repository.', ['status' => 404]);
+        if ($r['code'] !== 200) return $this->error($r, 'reading the latest commit');
+        $j = (array) $r['json'];
+        switch ($this->provider) {
+            case 'github':
+                $c = ['sha' => $j['sha'] ?? '', 'message' => $j['commit']['message'] ?? '', 'by' => $j['commit']['author']['name'] ?? '', 'date' => $j['commit']['committer']['date'] ?? ($j['commit']['author']['date'] ?? ''), 'url' => $j['html_url'] ?? '']; break;
+            case 'gitlab':
+                $k = (array) ($j['commit'] ?? []);
+                $c = ['sha' => $k['id'] ?? '', 'message' => $k['message'] ?? ($k['title'] ?? ''), 'by' => $k['author_name'] ?? '', 'date' => $k['committed_date'] ?? '', 'url' => $k['web_url'] ?? '']; break;
+            case 'gitea':
+                $k = (array) ($j['commit'] ?? []);
+                $c = ['sha' => $k['id'] ?? '', 'message' => $k['message'] ?? '', 'by' => $k['author']['name'] ?? '', 'date' => $k['timestamp'] ?? '', 'url' => $k['url'] ?? '']; break;
+            default: // bitbucket
+                $k = (array) ($j['target'] ?? []);
+                $by = $k['author']['user']['display_name'] ?? preg_replace('/\s*<[^>]*>$/', '', (string) ($k['author']['raw'] ?? ''));
+                $c = ['sha' => $k['hash'] ?? '', 'message' => $k['message'] ?? '', 'by' => $by, 'date' => $k['date'] ?? '', 'url' => $k['links']['html']['href'] ?? ''];
+        }
+        if ($c['sha'] === '') return new \WP_Error('git_commit', 'Couldn’t read the latest commit of “' . $this->branch . '”.');
+        $c['message'] = trim(strtok((string) $c['message'], "\n"));
+        $c['date'] = strtotime((string) $c['date']) ?: 0;
+        return $c;
+    }
+
+    /** Zip archive of the repository at a commit. */
+    private function archive_url($sha) {
+        $s = rawurlencode($sha);
+        switch ($this->provider) {
+            case 'github':    return $this->repo_base() . '/zipball/' . $s;
+            case 'gitlab':    return $this->repo_base() . '/repository/archive.zip?sha=' . $s;
+            case 'gitea':     return $this->repo_base() . '/archive/' . $s . '.zip';
+            case 'bitbucket': return 'https://bitbucket.org/' . $this->path . '/get/' . $s . '.zip';
+        }
+        return '';
+    }
+
+    /**
+     * Download the repository at $sha as a zip into $file.
+     * Redirects to another host (GitHub codeload, Bitbucket storage) are followed without our token.
+     * @return true|\WP_Error
+     */
+    public function download_archive($sha, $file) {
+        $url = $this->archive_url($sha);
+        if ($url === '') return new \WP_Error('git_provider', 'Unsupported provider.');
+        $ua = 'MasCamp-DocSync/' . (defined('MASCAMP_DOCSYNC_VERSION') ? MASCAMP_DOCSYNC_VERSION : '1');
+        $base = ['timeout' => 300, 'stream' => true, 'filename' => $file, 'user-agent' => $ua];
+        $r = wp_remote_get($url, $base + ['redirection' => 0, 'headers' => $this->headers()]);
+        for ($hops = 0; !is_wp_error($r) && in_array((int) wp_remote_retrieve_response_code($r), [301, 302, 303, 307, 308], true) && $hops < 5; $hops++) {
+            $loc = (string) wp_remote_retrieve_header($r, 'location');
+            if ($loc === '') break;
+            if ($loc[0] === '/') $loc = preg_replace('~^(https?://[^/]+).*$~', '$1', $url) . $loc;
+            $same = strtolower((string) parse_url($loc, PHP_URL_HOST)) === strtolower((string) parse_url($url, PHP_URL_HOST));
+            $url = $loc;
+            $r = wp_remote_get($url, $base + ['redirection' => 0, 'headers' => $same ? $this->headers() : []]);
+        }
+        if (is_wp_error($r)) return new \WP_Error('git_download', 'Download failed: ' . $r->get_error_message());
+        $code = (int) wp_remote_retrieve_response_code($r);
+        if ($code !== 200) {
+            $body = @file_get_contents($file, false, null, 0, 2000);
+            return $this->error(['code' => $code, 'body' => (string) $body, 'json' => json_decode((string) $body, true)], 'downloading the repository');
+        }
+        $head = @file_get_contents($file, false, null, 0, 2);
+        if ($head !== 'PK') return new \WP_Error('git_download', 'The download from ' . $this->provider_label() . ' wasn’t a zip file. Check the token can read this repository.');
+        return true;
+    }
 }

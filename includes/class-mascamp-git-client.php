@@ -232,4 +232,85 @@ final class GitClient {
         }
         return '';
     }
+
+    /* ---------------------------------------------------------------- Sync Monitor support */
+
+    /** Git's blob id for some content (what tree listings report per file). */
+    public static function blob_sha($content) { return sha1('blob ' . strlen($content) . "\0" . $content); }
+
+    /**
+     * Every file under $folder on the branch: [path => blob sha]. One or a few API calls.
+     * Returns null when the provider can't list blob ids cheaply (Bitbucket), or WP_Error.
+     */
+    public function list_tree($folder = '') {
+        $prefix = $folder !== '' ? rtrim($folder, '/') . '/' : '';
+        $out = [];
+        switch ($this->provider) {
+            case 'github':
+                $r = $this->request('GET', $this->repo_base() . '/git/trees/' . rawurlencode($this->branch) . '?recursive=1');
+                if (is_wp_error($r)) return $r;
+                if ($r['code'] !== 200) return $this->error($r, 'listing repository files');
+                foreach ((array) ($r['json']['tree'] ?? []) as $e) {
+                    if (($e['type'] ?? '') === 'blob' && ($prefix === '' || strpos($e['path'], $prefix) === 0)) $out[$e['path']] = $e['sha'];
+                }
+                return $out;
+            case 'gitea':
+                for ($page = 1; $page <= 30; $page++) {
+                    $r = $this->request('GET', $this->repo_base() . '/git/trees/' . rawurlencode($this->branch) . '?recursive=true&per_page=1000&page=' . $page);
+                    if (is_wp_error($r)) return $r;
+                    if ($r['code'] !== 200) return $this->error($r, 'listing repository files');
+                    $tree = (array) ($r['json']['tree'] ?? []);
+                    foreach ($tree as $e) {
+                        if (($e['type'] ?? '') === 'blob' && ($prefix === '' || strpos($e['path'], $prefix) === 0)) $out[$e['path']] = $e['sha'];
+                    }
+                    if (empty($r['json']['truncated']) || !$tree) break;
+                }
+                return $out;
+            case 'gitlab':
+                for ($page = 1; $page <= 100; $page++) {
+                    $q = ['ref' => $this->branch, 'recursive' => 'true', 'per_page' => 100, 'page' => $page];
+                    if ($prefix !== '') $q['path'] = rtrim($prefix, '/');
+                    $r = $this->request('GET', $this->repo_base() . '/repository/tree?' . http_build_query($q));
+                    if (is_wp_error($r)) return $r;
+                    if ($r['code'] === 404 && $page === 1 && $prefix !== '') return []; // folder doesn't exist yet
+                    if ($r['code'] !== 200) return $this->error($r, 'listing repository files');
+                    $rows = (array) $r['json'];
+                    foreach ($rows as $e) if (($e['type'] ?? '') === 'blob') $out[$e['path']] = $e['id'];
+                    if (count($rows) < 100) break;
+                }
+                return $out;
+        }
+        return null; // bitbucket: no cheap blob listing
+    }
+
+    /** Latest commit touching $path: ['by', 'when' (unix), 'message', 'url'] or null. */
+    public function last_commit($path) {
+        switch ($this->provider) {
+            case 'github':
+                $r = $this->request('GET', $this->repo_base() . '/commits?' . http_build_query(['path' => $path, 'sha' => $this->branch, 'per_page' => 1]));
+                $c = (!is_wp_error($r) && $r['code'] === 200) ? ($r['json'][0] ?? null) : null;
+                return $c ? ['by' => $c['commit']['author']['name'] ?? '', 'when' => strtotime($c['commit']['author']['date'] ?? '') ?: 0, 'message' => strtok((string) ($c['commit']['message'] ?? ''), "\n"), 'url' => $c['html_url'] ?? ''] : null;
+            case 'gitea':
+                $r = $this->request('GET', $this->repo_base() . '/commits?' . http_build_query(['path' => $path, 'sha' => $this->branch, 'limit' => 1]));
+                $c = (!is_wp_error($r) && $r['code'] === 200) ? ($r['json'][0] ?? null) : null;
+                return $c ? ['by' => $c['commit']['author']['name'] ?? '', 'when' => strtotime($c['commit']['author']['date'] ?? '') ?: 0, 'message' => strtok((string) ($c['commit']['message'] ?? ''), "\n"), 'url' => $c['html_url'] ?? ''] : null;
+            case 'gitlab':
+                $r = $this->request('GET', $this->repo_base() . '/repository/commits?' . http_build_query(['path' => $path, 'ref_name' => $this->branch, 'per_page' => 1]));
+                $c = (!is_wp_error($r) && $r['code'] === 200) ? ($r['json'][0] ?? null) : null;
+                return $c ? ['by' => $c['author_name'] ?? '', 'when' => strtotime($c['committed_date'] ?? '') ?: 0, 'message' => (string) ($c['title'] ?? ''), 'url' => $c['web_url'] ?? ''] : null;
+        }
+        return null;
+    }
+
+    public function history_url($path) {
+        $b = rawurlencode($this->branch); $p = self::enc_path($path);
+        switch ($this->provider) {
+            case 'github': return 'https://' . $this->host . '/' . $this->path . '/commits/' . $b . '/' . $p;
+            case 'gitlab': return $this->scheme . '://' . $this->host . '/' . $this->path . '/-/commits/' . $b . '/' . $p;
+            case 'gitea': return $this->scheme . '://' . $this->host . '/' . $this->path . '/commits/branch/' . $b . '/' . $p;
+        }
+        return $this->web_url($path);
+    }
+
+    public function provider() { return $this->provider; }
 }

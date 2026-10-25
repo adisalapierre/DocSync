@@ -24,7 +24,7 @@ final class GitDestination extends Destination {
         ];
     }
 
-    public function extra_keys() { return ['_mascamp_git_url']; }
+    public function extra_keys() { return ['_mascamp_git_url', '_mascamp_git_blob', '_mascamp_git_wp_modified']; }
 
     public function hooks() {
         add_action('admin_post_mascamp_docsync_git_test', [$this, 'test_connection']);
@@ -184,6 +184,7 @@ final class GitDestination extends Destination {
             if ($existing && $existing['content'] !== null && $existing['content'] === $markdown) {
                 $this->set_meta($post->ID, 'link', $path);
                 update_post_meta($post->ID, '_mascamp_git_url', esc_url_raw($c->web_url($path)));
+                update_post_meta($post->ID, '_mascamp_git_blob', GitClient::blob_sha($markdown));
                 return ['status' => 'Up to date'];
             }
             $title = Module::plain_title($post->ID);
@@ -194,6 +195,7 @@ final class GitDestination extends Destination {
             if (is_wp_error($put)) return $put;
             $this->set_meta($post->ID, 'link', $path);
             update_post_meta($post->ID, '_mascamp_git_url', esc_url_raw($put['url']));
+            update_post_meta($post->ID, '_mascamp_git_blob', GitClient::blob_sha($markdown)); // what we committed: the Sync Monitor baseline
             return ['status' => 'Synced'];
         }
         return new \WP_Error('git_conflict', 'The file kept changing in the repository. Sync again.');
@@ -229,5 +231,49 @@ final class GitDestination extends Destination {
 
         $body = MarkdownConverter::convert(Module::content_html($id));
         return "---\n" . implode("\n", $fm) . "\n---\n\n" . ($body !== '' ? $body . "\n" : '');
+    }
+
+    /* ---------------------------------------------------------------- Sync Monitor: remote scan */
+
+    public function history_url($post_id) {
+        $path = $this->meta($post_id, 'link');
+        $c = $this->client();
+        return ($path && !is_wp_error($c)) ? $c->history_url($path) : $this->view_url($post_id);
+    }
+
+    /**
+     * One tree listing compares each synced file's current blob id with the one DocSync committed.
+     * Different = edited in the repository; absent = deleted/moved. Bitbucket can't list blob ids,
+     * so only WordPress-side changes are reported there.
+     */
+    public function scan_remote(array $post_ids) {
+        $c = $this->client();
+        if (is_wp_error($c)) return ['items' => [], 'checked' => 0, 'note' => $c->get_error_message()];
+        $paths = [];
+        foreach ($post_ids as $pid) { $p = $this->meta($pid, 'link'); if ($p) $paths[(int) $pid] = $p; }
+        if (!$paths) return ['items' => [], 'checked' => 0, 'note' => ''];
+
+        $tree = $c->list_tree($this->settings()['folder']);
+        if ($tree === null) return ['items' => [], 'checked' => 0, 'note' => 'Bitbucket can’t report edits made directly in the repository, so only WordPress-side Git changes are shown.'];
+        if (is_wp_error($tree)) return ['items' => [], 'checked' => 0, 'note' => 'Couldn’t read the repository: ' . $tree->get_error_message()];
+
+        $items = []; $lookups = 0;
+        foreach ($paths as $pid => $path) {
+            $remote = $tree[$path] ?? null;
+            if ($remote === null) {
+                $items[$pid] = ['state' => 'missing', 'when' => 0, 'by' => '', 'detail' => 'The file is missing from the repository (deleted, moved, or the branch changed).', 'url' => $c->history_url($path)];
+                continue;
+            }
+            $known = (string) get_post_meta($pid, '_mascamp_git_blob', true);
+            if ($known === '') { update_post_meta($pid, '_mascamp_git_blob', $remote); continue; } // synced before baselines existed
+            if ($remote === $known) continue;
+            $lc = $lookups++ < 25 ? $c->last_commit($path) : null;
+            $items[$pid] = [
+                'state' => 'changed', 'when' => $lc['when'] ?? 0, 'by' => $lc['by'] ?? '',
+                'detail' => 'Changed in the repository' . (!empty($lc['message']) ? ': “' . $lc['message'] . '”' : ''),
+                'url' => $lc['url'] ?? $c->history_url($path),
+            ];
+        }
+        return ['items' => $items, 'checked' => count($paths), 'note' => ''];
     }
 }

@@ -62,6 +62,36 @@ abstract class Destination {
     /** Other post meta this destination writes that belongs to the linked copy (cleared with the link). */
     public function extra_keys() { return []; }
 
+    /* ------------------------------------------------ Sync Monitor support */
+
+    /** Meta holding post_modified_gmt at the last successful sync (the WordPress-side baseline). */
+    public function wpmod_key() { return '_mascamp_' . $this->id() . '_wp_modified'; }
+
+    public function record_wp_baseline($post_id) {
+        clean_post_cache($post_id);
+        update_post_meta($post_id, $this->wpmod_key(), get_post_field('post_modified_gmt', $post_id));
+    }
+
+    /** Has the post been edited in WordPress since its last sync here? null = never synced / unknown. */
+    public function wp_changed_since_sync($post_id) {
+        $mod = (string) get_post_field('post_modified_gmt', $post_id);
+        $known = (string) get_post_meta($post_id, $this->wpmod_key(), true);
+        if ($known !== '') return $mod > $known;
+        $synced = (string) $this->meta($post_id, 'synced'); // synced before baselines existed (local time)
+        if ($synced === '') return null;
+        return strtotime($mod) > strtotime(get_gmt_from_date($synced)) + 60;
+    }
+
+    /**
+     * Check the remote copies of these linked posts for changes made outside WordPress.
+     * @return array{items: array<int,array>, checked: int, note: string}
+     *   items[post_id] = ['state' => 'changed'|'missing', 'when' => int, 'by' => string, 'detail' => string, 'url' => string]
+     */
+    public function scan_remote(array $post_ids) { return ['items' => [], 'checked' => 0, 'note' => '']; }
+
+    /** URL showing the remote copy's change history, or ''. */
+    public function history_url($post_id) { return $this->view_url($post_id); }
+
     public function meta($post_id, $key) {
         $value = get_post_meta($post_id, $this->keys()[$key], true);
         if ($key === 'link' && $value !== '' && $this->link_is_copied((int) $post_id, (string) $value)) {

@@ -23,12 +23,16 @@ final class Module {
     public static $suppress = [];
     /** @var Destination[] */
     private $dests = [];
+    /** @var Monitor */
+    public $monitor;
 
     public static function instance() { return self::$instance ?: (self::$instance = new self()); }
 
     private function __construct() {
         $this->dests = ['gdocs' => new GDocsDestination($this), 'git' => new GitDestination($this)];
+        Log::install();
         foreach ($this->dests as $d) $d->hooks();
+        $this->monitor = new Monitor($this);
 
         // Yoast Duplicate Post: don't copy sync data onto duplicates (the ownership check
         // in Destination catches copies made by any other duplicator).
@@ -88,6 +92,8 @@ final class Module {
         $tabs = ['gdocs' => 'Google Docs', 'git' => 'Git'];
         $extra = [];
         foreach ($this->dests as $d) foreach ($d->tabs() as $slug => $label) { $tabs[$slug] = $label; $extra[$slug] = $d; }
+        $n = $this->monitor->count();
+        $tabs = ['changes' => 'Changes' . ($n ? ' <span class="awaiting-mod" style="display:inline-block;min-width:18px;padding:0 5px;border-radius:9px;background:#d63638;color:#fff;font-size:11px;line-height:18px;text-align:center">' . $n . '</span>' : '')] + $tabs;
         $tabs += ['all' => 'Sync all', 'help' => 'How it works'];
         $tab = sanitize_key($_GET['tab'] ?? 'gdocs');
         if (!isset($tabs[$tab])) $tab = 'gdocs';
@@ -97,10 +103,11 @@ final class Module {
         foreach ($tabs as $k => $label) {
             $dot = '';
             if (isset($this->dests[$k])) $dot = $this->dests[$k]->is_ready() ? ' <span style="color:#008a20">●</span>' : ' <span style="color:#a7aaad">○</span>';
-            echo '<a class="nav-tab' . ($k === $tab ? ' nav-tab-active' : '') . '" href="' . esc_url($this->settings_url($k)) . '">' . esc_html($label) . $dot . '</a>';
+            echo '<a class="nav-tab' . ($k === $tab ? ' nav-tab-active' : '') . '" href="' . esc_url($this->settings_url($k)) . '">' . wp_kses($label, ['span' => ['class' => [], 'style' => []]]) . $dot . '</a>';
         }
         echo '</nav>';
-        if (isset($this->dests[$tab])) $this->dests[$tab]->render_settings();
+        if ($tab === 'changes') $this->monitor->render_tab();
+        elseif (isset($this->dests[$tab])) $this->dests[$tab]->render_settings();
         elseif (isset($extra[$tab])) $extra[$tab]->render_tab($tab);
         elseif ($tab === 'all') $this->render_batch_section();
         else $this->render_help();
@@ -278,7 +285,7 @@ final class Module {
         }
     }
 
-    private function queue($dest, $post_id, $delay = 15) {
+    public function queue($dest, $post_id, $delay = 15) {
         $d = $this->dest($dest);
         if (!wp_next_scheduled(self::ITEM_HOOK, [$dest, $post_id])) wp_schedule_single_event(time() + $delay, self::ITEM_HOOK, [$dest, $post_id]);
         $d->set_meta($post_id, 'status', 'Queued');
@@ -292,6 +299,23 @@ final class Module {
      * Sync one post to one destination and record the result on the post. Returns true or WP_Error.
      */
     public function run($dest_id, $post_id) {
+        $target = Log::target($dest_id);
+        Log::add('Push', $dest_id === 'git' ? 'Post to Git started' : 'Post to Google Doc update started', $post_id, $dest_id);
+        $result = $this->run_inner($dest_id, $post_id);
+        $d = $this->dest($dest_id);
+        if ($result === true) {
+            $status = $d ? (string) $d->meta($post_id, 'status') : '';
+            if ($status === 'Up to date') Log::add('Update', 'Post to Git file already up to date (no commit needed)', $post_id, $dest_id, 'success');
+            else Log::add('Update', $dest_id === 'git' ? 'Post to Git file update complete' : 'Post to Google Doc update complete', $post_id, $dest_id, $status === 'Synced with warnings' ? 'warning' : 'success',
+                $status === 'Synced with warnings' ? implode(' | ', array_slice(array_filter((array) $d->meta($post_id, 'warn')), 0, 3)) : '');
+        } else {
+            Log::add('Error', 'Post to ' . $target . ' update failed', $post_id, $dest_id, 'error', is_wp_error($result) ? $result->get_error_message() : '');
+        }
+        do_action('mascamp_docsync_after_run', $dest_id, $post_id, $result);
+        return $result;
+    }
+
+    private function run_inner($dest_id, $post_id) {
         $d = $this->dest($dest_id);
         if (!$d) return new \WP_Error('invalid_destination', 'Unknown sync destination.');
         $post = get_post($post_id);
@@ -315,6 +339,7 @@ final class Module {
         $status = $r['status'] ?? ($warnings ? 'Synced with warnings' : 'Synced');
         $d->set_meta($post_id, 'status', $status);
         $d->set_meta($post_id, 'synced', current_time('mysql'));
+        $d->record_wp_baseline($post_id);
         if ($warnings) $d->set_meta($post_id, 'warn', $warnings); else $d->del_meta($post_id, 'warn');
         $d->del_meta($post_id, 'error');
         return true;
@@ -459,6 +484,7 @@ final class Module {
         if (!$ids) { $this->notice('success', 'Nothing to sync: no matching published ' . self::type_label($type) . '.'); wp_safe_redirect($back); exit; }
         foreach ($ids as $id) { $d->set_meta($id, 'status', 'Queued'); $d->del_meta($id, 'error'); }
         update_option(self::BATCH_OPTION, ['dest' => $dest, 'type' => $type, 'ids' => $ids, 'total' => count($ids), 'done' => 0, 'errors' => 0, 'started' => time(), 'pause_until' => 0], false);
+        Log::add('Sync all', sprintf('Sync all %s to %s started (%d items)', self::type_label($type), Log::target($dest), count($ids)), 0, $dest);
         delete_option(self::BATCH_LOCK);
         wp_clear_scheduled_hook(self::BATCH_HOOK);
         wp_schedule_single_event(time() + 30, self::BATCH_HOOK);
@@ -473,7 +499,10 @@ final class Module {
         if ($d) foreach ((array) ($b['ids'] ?? []) as $id) {
             if ($d->meta($id, 'status') === 'Queued') $d->del_meta($id, 'status');
         }
-        if ($b) { $b['ids'] = []; $b['finished'] = time(); $b['cancelled'] = true; update_option(self::BATCH_OPTION, $b, false); }
+        if ($b) {
+            $b['ids'] = []; $b['finished'] = time(); $b['cancelled'] = true; update_option(self::BATCH_OPTION, $b, false);
+            Log::add('Sync all', sprintf('Sync all cancelled after %d of %d items', (int) $b['done'], (int) $b['total']), 0, $b['dest'] ?? '', 'warning');
+        }
         wp_clear_scheduled_hook(self::BATCH_HOOK);
         delete_option(self::BATCH_LOCK);
         $this->notice('success', 'Sync all cancelled.');
@@ -556,7 +585,11 @@ final class Module {
                     $b['ids'] = [];
                 }
             }
-            if (empty($b['ids'])) $b['finished'] = time();
+            if (empty($b['ids'])) {
+                $b['finished'] = time();
+                if (!empty($b['stopped'])) Log::add('Sync all', sprintf('Sync all stopped: the first %d items failed with the same error', (int) $b['done']), 0, $dest, 'error', $b['stopped']);
+                else Log::add('Sync all', sprintf('Sync all %s to %s complete: %d synced, %d failed', self::type_label($b['type']), Log::target($dest), (int) $b['done'] - (int) $b['errors'], (int) $b['errors']), 0, $dest, $b['errors'] ? 'warning' : 'success');
+            }
             update_option(self::BATCH_OPTION, $b, false);
             $n++;
         }

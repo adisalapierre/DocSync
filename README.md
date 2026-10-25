@@ -2,11 +2,13 @@
 
 A standalone WordPress plugin that syncs chosen posts and pages to **Google Docs** and/or a **Git repository** (GitHub, GitLab, Bitbucket Cloud or Gitea). Google Docs is two-way: edits made in a doc can be pulled back into WordPress, and new posts can be written as Google Docs and imported as drafts.
 
-Install it in `wp-content/plugins/mascamp-docsync/` and activate **MasCamp DocSync**. Everything is configured under **Settings → MasCamp DocSync**, which has these tabs: *Google Docs*, *Git*, *Import from Docs*, *Sync all* and *How it works*.
+Install it in `wp-content/plugins/mascamp-docsync/` and activate **MasCamp DocSync**. Everything is configured under **Settings → MasCamp DocSync**, which has these tabs: *Changes*, *Google Docs*, *Git*, *Import from Docs*, *Sync all* and *How it works*.
 
 ## Files
 - `mascamp-docsync.php`: plugin entry point
 - `includes/class-mascamp-docsync.php`: core (settings page, editor box, Posts/Pages column, row and bulk actions, Sync all, queueing)
+- `includes/class-mascamp-docsync-monitor.php`: Sync Monitor (out-of-sync detection, admin notice, Changes tab)
+- `includes/class-mascamp-docsync-log.php`: activity log table
 - `includes/class-mascamp-docsync-destination.php`: base class shared by the destinations
 - `includes/class-mascamp-gdocs-destination.php`: Google Docs (OAuth, Drive/Docs API)
 - `includes/class-mascamp-gdocs-converter.php`: HTML → Google Docs formatting
@@ -77,6 +79,35 @@ define('MASCAMP_DOCSYNC_GIT_TOKEN', 'your-token');
 
 ## Duplicated posts
 Each post's link to its Git file and Google Doc is stamped with that post's ID. Duplicator plugins copy every custom field, so a duplicate arrives carrying the original's link. DocSync detects this (the stamp names another post) and clears the copied sync data, so the duplicate gets its own file and its own doc on its first sync and never overwrites the original's. *Keep synced* choices are kept. Posts linked before this check existed are handled too: the lowest-ID post with a given link is treated as the original. With Yoast Duplicate Post, DocSync's fields are also excluded from copying.
+
+## Sync Monitor and activity log
+**Settings → MasCamp DocSync → Changes** (the *View changes* button in the admin notice opens it).
+
+**Out of sync:** lists every post or page whose WordPress version and synced copies no longer match. For each one it shows where the difference is and who changed it, with the right fix button:
+
+| Situation | Shown as | Fix button |
+|---|---|---|
+| Edited in WordPress since the last sync | WordPress is newer | Sync to Google Docs / Sync to Git |
+| Edited directly in the Google Doc | Google Doc is newer (with the editor's name) | Pull into WordPress |
+| File changed directly in the repository | Git file is newer (with the commit author and message) | Overwrite with WordPress |
+| Changed on both sides | Changed on both sides | Keep doc version / Keep WordPress version |
+| Doc deleted or trashed, file deleted or moved | … missing | Recreate from WordPress |
+| Last sync failed | Sync failed (with the error) | Retry sync |
+
+- **Sync all WordPress changes** pushes every item that changed *only* in WordPress. Anything edited remotely is never overwritten by this button.
+- **How changes are detected:** WordPress edits are detected immediately. Google Drive and Git are checked hourly, or straight away with **Scan now**. A check uses one Drive folder listing and one repository tree listing. Only docs whose modified time changed get a second, precise revision check, so renames and sharing changes aren't reported as edits.
+- **Bitbucket** can't list file versions cheaply, so only WordPress-side Git changes are shown for Bitbucket repositories.
+- **Admin notice:** while anything is out of sync, every admin page shows "MasCamp DocSync has detected N changes…" with a **View changes** button. Dismissing it hides it until something else changes.
+
+**Activity log:** every event is recorded with a heading, an event type and a time, for example:
+
+```
+Push
+Event Type: Post to Git started
+Time: October 25, 2026 1:22:03 pm
+```
+
+Headings are **Push**, **Pull**, **Update**, **Sync Update** (scans), **Change detected**, **Import**, **Sync all** and **Error**. You can filter by **activity type** and by **location** (Google Docs or Git), and tick **Only posts with sync issues** to see only the posts that are currently out of sync. Each post's **activity history** link shows only that post's events. Events are kept for 90 days in their own database table (`wp_mascamp_docsync_log`).
 
 ## Notes and limitations
 - Elementor pages are synced from their rendered content. Page-builder layout (columns, spacing, backgrounds) is not kept: content comes through stacked in page order.

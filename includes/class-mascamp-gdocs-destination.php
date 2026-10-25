@@ -11,6 +11,7 @@ final class GDocsDestination extends Destination {
     const META_WPMOD    = '_mascamp_gdocs_wp_modified';   // post_modified_gmt at the last sync
     const META_FEATURED = '_mascamp_gdocs_pushed_featured';
     const META_IMPORTED = '_mascamp_gdocs_imported';
+    const META_DRIVEMOD = '_mascamp_gdocs_drive_modified'; // Drive modifiedTime at the last sync (Sync Monitor baseline)
 
     public function id() { return 'gdocs'; }
     public function label() { return 'Google Docs'; }
@@ -29,7 +30,7 @@ final class GDocsDestination extends Destination {
     }
 
     public function extra_keys() {
-        return [self::META_REV, self::META_WPMOD, self::META_FEATURED, self::META_IMPORTED, '_mascamp_gdocs_source_url'];
+        return [self::META_REV, self::META_WPMOD, self::META_FEATURED, self::META_IMPORTED, self::META_DRIVEMOD, '_mascamp_gdocs_source_url'];
     }
 
     public function hooks() {
@@ -41,6 +42,8 @@ final class GDocsDestination extends Destination {
     }
 
     public function set_force($force) { $this->force = (bool) $force; }
+
+    public function wpmod_key() { return self::META_WPMOD; }
 
     private function settings() {
         return wp_parse_args(get_option($this->option, []), [
@@ -331,9 +334,15 @@ final class GDocsDestination extends Destination {
     private function remember_sync($post_id, $doc_id) {
         $d = $this->api('GET', 'https://docs.googleapis.com/v1/documents/' . rawurlencode($doc_id) . '?fields=revisionId');
         if (!is_wp_error($d) && !empty($d['revisionId'])) update_post_meta($post_id, self::META_REV, $d['revisionId']);
-        clean_post_cache($post_id);
-        update_post_meta($post_id, self::META_WPMOD, get_post_field('post_modified_gmt', $post_id));
+        $this->record_wp_baseline($post_id);
+        $this->remember_drive_time($post_id, $doc_id);
         delete_transient('mcds_docrev_' . $post_id);
+    }
+
+    /** Drive's modifiedTime right after a sync: the cheap first check the Sync Monitor uses. */
+    private function remember_drive_time($post_id, $doc_id) {
+        $f = $this->api('GET', 'https://www.googleapis.com/drive/v3/files/' . rawurlencode($doc_id) . '?fields=modifiedTime&supportsAllDrives=true');
+        if (!is_wp_error($f) && !empty($f['modifiedTime'])) update_post_meta($post_id, self::META_DRIVEMOD, $f['modifiedTime']);
     }
 
     /** true = doc edited since last sync, false = unchanged, null = unknown. Cached briefly to keep the editor fast. */
@@ -408,6 +417,14 @@ final class GDocsDestination extends Destination {
      * @return array{warnings:string[]}|\WP_Error
      */
     public function pull($post_id, $is_import = false) {
+        Log::add('Pull', $is_import ? 'Google Doc to new draft import started' : 'Google Doc to Post update started', $post_id, 'gdocs');
+        $r = $this->pull_inner($post_id, $is_import);
+        if (is_wp_error($r)) Log::add('Error', 'Google Doc to Post update failed', $post_id, 'gdocs', 'error', $r->get_error_message());
+        else Log::add($is_import ? 'Import' : 'Update', $is_import ? 'Google Doc imported as a new draft ' . get_post_type($post_id) : 'Google Doc to Post update complete', $post_id, 'gdocs', $r['warnings'] ? 'warning' : 'success', implode(' | ', array_slice($r['warnings'], 0, 3)));
+        return $r;
+    }
+
+    private function pull_inner($post_id, $is_import = false) {
         $ready = $this->ready();
         if (is_wp_error($ready)) return $ready;
         $post = get_post($post_id);
@@ -450,9 +467,10 @@ final class GDocsDestination extends Destination {
         $this->del_meta($post_id, 'error');
         if ($warnings) $this->set_meta($post_id, 'warn', $warnings); else $this->del_meta($post_id, 'warn');
         if (!empty($doc['revisionId'])) update_post_meta($post_id, self::META_REV, $doc['revisionId']);
-        clean_post_cache($post_id);
-        update_post_meta($post_id, self::META_WPMOD, get_post_field('post_modified_gmt', $post_id));
+        $this->record_wp_baseline($post_id);
+        $this->remember_drive_time($post_id, $doc_id);
         delete_transient('mcds_docrev_' . $post_id);
+        do_action('mascamp_docsync_after_run', 'gdocs', $post_id, true);
         return ['warnings' => $warnings];
     }
 
@@ -499,6 +517,69 @@ final class GDocsDestination extends Destination {
         update_post_meta($aid, '_mascamp_gdocs_md5', $md5);
         if ($alt !== '') update_post_meta($aid, '_wp_attachment_image_alt', $alt);
         return ['id' => $aid, 'url' => wp_get_attachment_image_url($aid, 'large') ?: wp_get_attachment_url($aid), 'alt' => $alt];
+    }
+
+    /* ---------------------------------------------------------------- Sync Monitor: remote scan */
+
+    /**
+     * One Drive listing per folder gives every doc's modifiedTime and last editor. Only docs whose
+     * modifiedTime moved since the last sync get a second, precise check (Docs revisionId), so a
+     * rename or sharing change isn't reported as an edit.
+     */
+    public function scan_remote(array $post_ids) {
+        $s = $this->settings();
+        $map = [];
+        foreach ($post_ids as $pid) { $doc = $this->meta($pid, 'link'); if ($doc) $map[$doc] = (int) $pid; }
+        if (!$map) return ['items' => [], 'checked' => 0, 'note' => ''];
+
+        $files = []; $note = '';
+        foreach (array_unique(array_filter([$s['folder_id'], $s['import_folder']])) as $folder) {
+            $token = '';
+            for ($page = 0; $page < 20; $page++) {
+                $q = "'" . str_replace("'", "\\'", $folder) . "' in parents and trashed=false and mimeType='application/vnd.google-apps.document'";
+                $r = $this->api('GET', 'https://www.googleapis.com/drive/v3/files?' . http_build_query(array_filter([
+                    'q' => $q, 'pageSize' => 1000, 'pageToken' => $token,
+                    'fields' => 'nextPageToken,files(id,name,modifiedTime,lastModifyingUser(displayName,emailAddress))',
+                    'supportsAllDrives' => 'true', 'includeItemsFromAllDrives' => 'true',
+                ])));
+                if (is_wp_error($r)) { $note = 'Couldn’t list a Drive folder: ' . $r->get_error_message(); break; }
+                foreach ($r['files'] ?? [] as $f) $files[$f['id']] = $f;
+                $token = $r['nextPageToken'] ?? '';
+                if ($token === '') break;
+            }
+        }
+
+        $items = []; $lookups = 0; $revchecks = 0;
+        foreach ($map as $doc_id => $pid) {
+            $f = $files[$doc_id] ?? null;
+            if (!$f) { // not in the folders (moved, trashed or deleted): look it up directly
+                if ($lookups++ >= 60) continue;
+                $g = $this->api('GET', 'https://www.googleapis.com/drive/v3/files/' . rawurlencode($doc_id) . '?fields=id,name,modifiedTime,trashed,lastModifyingUser(displayName,emailAddress)&supportsAllDrives=true');
+                if (is_wp_error($g)) {
+                    if (self::http_status($g) === 404) $items[$pid] = ['state' => 'missing', 'when' => 0, 'by' => '', 'detail' => 'The Google Doc was deleted, or the connected account can no longer open it.', 'url' => ''];
+                    continue;
+                }
+                if (!empty($g['trashed'])) { $items[$pid] = ['state' => 'missing', 'when' => strtotime($g['modifiedTime'] ?? '') ?: 0, 'by' => $g['lastModifyingUser']['displayName'] ?? '', 'detail' => 'The Google Doc is in the Drive trash.', 'url' => $this->view_url($pid)]; continue; }
+                $f = $g;
+            }
+            $known = get_post_meta($pid, self::META_DRIVEMOD, true);
+            if ($known && ($f['modifiedTime'] ?? '') === $known) continue; // untouched since the last sync
+
+            // Something changed (or there's no baseline yet): confirm against the doc's revision.
+            if ($revchecks++ >= 150) continue;
+            $rev = $this->api('GET', 'https://docs.googleapis.com/v1/documents/' . rawurlencode($doc_id) . '?fields=revisionId');
+            if (is_wp_error($rev) || empty($rev['revisionId'])) continue;
+            $krev = get_post_meta($pid, self::META_REV, true);
+            if (!$krev || $rev['revisionId'] === $krev) { // no content change: refresh the cheap baseline
+                if (!empty($f['modifiedTime'])) update_post_meta($pid, self::META_DRIVEMOD, $f['modifiedTime']);
+                continue;
+            }
+            set_transient('mcds_docrev_' . $pid, $rev['revisionId'], 2 * MINUTE_IN_SECONDS);
+            $who = $f['lastModifyingUser']['displayName'] ?? ($f['lastModifyingUser']['emailAddress'] ?? '');
+            $items[$pid] = ['state' => 'changed', 'when' => strtotime($f['modifiedTime'] ?? '') ?: 0, 'by' => $who, 'detail' => 'Edited in Google Docs', 'url' => $this->view_url($pid)];
+        }
+        if ($lookups > 60) $note = trim($note . ' Some docs outside the sync folders weren’t checked this time.');
+        return ['items' => $items, 'checked' => count($map), 'note' => $note];
     }
 
     /* ---------------------------------------------------------------- Import new posts from a Drive folder */

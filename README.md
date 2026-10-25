@@ -109,6 +109,14 @@ Time: October 25, 2026 1:22:03 pm
 
 Headings are **Push**, **Pull**, **Update**, **Sync Update** (scans), **Change detected**, **Import**, **Sync all** and **Error**. You can filter by **activity type** and by **location** (Google Docs or Git), and tick **Only posts with sync issues** to see only the posts that are currently out of sync. Each post's **activity history** link shows only that post's events. Events are kept for 90 days in their own database table (`wp_mascamp_docsync_log`).
 
+## Progress and background jobs
+- **Long tasks run in the background, with a progress bar:** *Sync all posts/pages*, *Sync all WordPress changes* and *Scan now*. While a job runs:
+  - The **Changes** and **Sync all** tabs show a full progress panel: what's being done now, *N of M* done, errors and the latest error, plus a **Cancel** button.
+  - Every other admin page shows a compact progress notice, and the admin bar shows **DocSync N of M**.
+  - **You can leave the page or close the browser.** The job carries on through WP-Cron, a little more slowly. Keeping any admin page open makes it finish faster, because each open page also runs steps. The result appears in the Activity log.
+  - Only one job runs at a time. *Scan now* and the bulk buttons are disabled until the current job finishes.
+- **Single actions** (*Sync to Google Docs/Git now*, *Pull from Google Doc*, *Retry*, *Import*) show a "working…" notification as soon as you click. They usually take a few seconds. If you leave the page during one, it still finishes on the server.
+
 ## Notes and limitations
 - Elementor pages are synced from their rendered content. Page-builder layout (columns, spacing, backgrounds) is not kept: content comes through stacked in page order.
 - Only published posts and pages sync, and each sync copies the last *saved* version.

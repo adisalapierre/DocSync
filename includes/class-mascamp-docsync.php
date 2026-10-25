@@ -53,6 +53,9 @@ final class Module {
         add_action('admin_post_mascamp_docsync_batch_cancel', [$this, 'batch_cancel']);
         add_action('wp_ajax_mascamp_docsync_batch_step', [$this, 'batch_ajax_step']);
         add_action(self::BATCH_HOOK, [$this, 'batch_cron']);
+        add_action('admin_notices', [$this, 'job_notice'], 4);
+        add_action('admin_bar_menu', [$this, 'admin_bar'], 90);
+        add_action('admin_footer', [$this, 'footer_script']);
         foreach (self::TYPES as $type) {
             add_filter("manage_{$type}_posts_columns", [$this, 'add_column']);
             add_action("manage_{$type}_posts_custom_column", [$this, 'render_column'], 10, 2);
@@ -164,7 +167,7 @@ final class Module {
                 foreach ($warns as $w) echo '<li>' . esc_html($w) . '</li>';
                 echo '</ul></details>';
             }
-            if ($published) echo '<p style="margin:6px 0"><a class="button" href="' . esc_url($this->sync_url($id, $post->ID)) . '">Sync to ' . esc_html($d->label()) . ' now</a></p>';
+            if ($published) echo '<p style="margin:6px 0"><a class="button mcds-run" data-mcds-title="' . esc_attr('Syncing to ' . $d->label() . '…') . '" data-mcds-text="Usually a few seconds. If you leave, it still finishes on the server and the result appears in the DocSync Activity log. Save any unsaved changes first." href="' . esc_url($this->sync_url($id, $post->ID)) . '">Sync to ' . esc_html($d->label()) . ' now</a></p>';
             $d->metabox_extra($post);
             echo '<input type="hidden" name="mascamp_docsync_auto_present[' . esc_attr($id) . ']" value="1">';
             echo '<p style="margin:4px 0"><label><input type="checkbox" name="mascamp_docsync_auto[' . esc_attr($id) . ']" value="1" ' . checked($d->meta($post->ID, 'auto'), '1', false) . '> Keep synced</label>';
@@ -208,7 +211,7 @@ final class Module {
     public function row_actions($actions, $post) {
         if (!in_array($post->post_type, self::TYPES, true) || $post->post_status !== 'publish' || !current_user_can('edit_post', $post->ID)) return $actions;
         foreach ($this->ready_dests() as $id => $d) {
-            $actions['mascamp_docsync_' . $id] = '<a href="' . esc_url($this->sync_url($id, $post->ID)) . '">Sync to ' . esc_html($d->label()) . '</a>';
+            $actions['mascamp_docsync_' . $id] = '<a class="mcds-run" data-mcds-title="' . esc_attr('Syncing “' . self::plain_title($post->ID) . '” to ' . $d->label() . '…') . '" href="' . esc_url($this->sync_url($id, $post->ID)) . '">Sync to ' . esc_html($d->label()) . '</a>';
             $actions += $d->row_actions_extra($post);
         }
         return $actions;
@@ -251,6 +254,7 @@ final class Module {
         $d = $this->dest($dest);
         if (!$d || !$post_id || !current_user_can('edit_post', $post_id)) wp_die('Forbidden', 403);
         check_admin_referer('mascamp_docsync_now_' . $dest . '_' . $post_id);
+        if (function_exists('ignore_user_abort')) ignore_user_abort(true); // finish even if the person leaves the page
         $d->set_force(!empty($_GET['force']));
         $result = $this->run($dest, $post_id);
         $d->set_force(false);
@@ -383,56 +387,96 @@ final class Module {
         return class_exists('\Elementor\Plugin') && get_post_meta($post_id, '_elementor_edit_mode', true) === 'builder';
     }
 
-    /* ---------------------------------------------------------------- Sync all (background batch) */
+    /* ---------------------------------------------------------------- Background jobs (Sync all, Sync all WordPress changes, Scan now) */
 
-    private function batch() { return get_option(self::BATCH_OPTION, []); }
-    private function batch_running() { $b = $this->batch(); return !empty($b['total']) && empty($b['finished']); }
+    /**
+     * One job at a time. A job is a labelled list of steps, each ['kind' => 'sync'|'scan', 'dest' => id, 'id' => post ID].
+     * Steps run one by one: from the browser while any admin page is open (fast), and via WP-Cron otherwise (slower),
+     * so people can leave the page and keep working.
+     */
+    public function batch() {
+        $b = get_option(self::BATCH_OPTION, []);
+        if ($b && !isset($b['items']) && isset($b['ids'])) { // job saved by 0.4.0 or earlier
+            $dest = $b['dest'] ?? 'gdocs';
+            $b['items'] = array_map(static function ($id) use ($dest) { return ['kind' => 'sync', 'dest' => $dest, 'id' => (int) $id]; }, (array) $b['ids']);
+            $b['label'] = $b['label'] ?? sprintf('Syncing all %s to %s', self::type_label($b['type'] ?? 'post'), Log::target($dest));
+            unset($b['ids']);
+        }
+        return $b;
+    }
+    public function batch_running() { $b = $this->batch(); return !empty($b['total']) && empty($b['finished']); }
     private static function type_label($type, $plural = true) {
         $o = get_post_type_object($type);
         return $o ? strtolower($plural ? $o->labels->name : $o->labels->singular_name) : $type;
     }
 
-    private function render_batch_section() {
+    /** Starts a job. Returns false if another job is running. */
+    public function start_job($label, array $steps, $log_dest = '') {
+        if ($this->batch_running() || !$steps) return false;
+        foreach ($steps as $st) {
+            if ($st['kind'] === 'sync' && ($d = $this->dest($st['dest']))) { $d->set_meta($st['id'], 'status', 'Queued'); $d->del_meta($st['id'], 'error'); }
+        }
+        update_option(self::BATCH_OPTION, ['label' => $label, 'items' => array_values($steps), 'total' => count($steps), 'done' => 0, 'errors' => 0,
+            'started' => time(), 'pause_until' => 0, 'current' => '', 'dest' => $log_dest, 'user' => get_current_user_id()], false);
+        Log::add(count($steps) > 1 || $steps[0]['kind'] === 'scan' ? 'Sync all' : 'Push', $label . ' started (' . count($steps) . ' ' . _n('step', 'steps', count($steps)) . ')', 0, $log_dest);
+        delete_option(self::BATCH_LOCK);
+        wp_clear_scheduled_hook(self::BATCH_HOOK);
+        wp_schedule_single_event(time() + 20, self::BATCH_HOOK);
+        return true;
+    }
+
+    /** Progress panel. $compact = one-line version for the admin notice on other pages. */
+    public function render_progress($compact = false) {
         $b = $this->batch();
-        if ($this->batch_running()) {
-            $d = $this->dest($b['dest'] ?? 'gdocs');
-            $total = (int) $b['total']; $done = (int) $b['done'];
-            $pct = $total ? (int) floor($done * 100 / $total) : 0;
-            echo '<div style="max-width:640px">';
-            echo '<p><strong>Syncing all ' . esc_html(self::type_label($b['type'])) . ' to ' . esc_html($d ? $d->label() : '') . ':</strong> <span id="mcds-count">' . $done . ' of ' . $total . '</span> · <span id="mcds-errors">' . (int) $b['errors'] . '</span> error(s)</p>';
-            echo '<div style="background:#dcdcde;border-radius:4px;height:14px;overflow:hidden"><div id="mcds-bar" style="background:#2271b1;height:14px;width:' . $pct . '%;transition:width .4s"></div></div>';
-            echo '<p class="description" id="mcds-note">Keep this page open to finish faster. If you close it, syncing continues in the background, more slowly.</p>';
-            echo '<p id="mcds-last-error" style="color:#b32d2e' . (empty($b['failures']) ? ';display:none' : '') . '">Latest error: <span>' . esc_html(empty($b['failures']) ? '' : end($b['failures'])['error']) . '</span></p>';
-            echo '<form method="post" action="' . esc_url(admin_url('admin-post.php')) . '"><input type="hidden" name="action" value="mascamp_docsync_batch_cancel">';
-            wp_nonce_field('mascamp_docsync_batch_cancel');
-            submit_button('Cancel', 'secondary', 'submit', false);
-            echo '</form></div>';
-            $this->render_failures($b);
-            $ajax = esc_url_raw(admin_url('admin-ajax.php'));
-            $nonce = wp_create_nonce('mascamp_docsync_batch_step');
-            echo "<script>(function(){var busy=false,fails=0;function step(){if(busy)return;busy=true;var f=new FormData();f.append('action','mascamp_docsync_batch_step');f.append('_ajax_nonce'," . wp_json_encode($nonce) . ");fetch(" . wp_json_encode($ajax) . ",{method:'POST',body:f,credentials:'same-origin'}).then(function(r){return r.json();}).then(function(r){busy=false;fails=0;if(!r||!r.success){return setTimeout(step,5000);}var d=r.data;document.getElementById('mcds-count').textContent=d.done+' of '+d.total;document.getElementById('mcds-errors').textContent=d.errors;document.getElementById('mcds-bar').style.width=(d.total?Math.floor(d.done*100/d.total):100)+'%';if(d.wait){document.getElementById('mcds-note').textContent='Rate limit reached. Pausing for a minute, then continuing automatically.';}if(d.last_error){var le=document.getElementById('mcds-last-error');le.style.display='';le.querySelector('span').textContent=d.last_error;}if(d.finished){location.reload();return;}setTimeout(step,d.wait?d.wait*1000:1200);}).catch(function(){busy=false;if(++fails<20)setTimeout(step,5000);});}setTimeout(step,500);})();</script>";
+        if (!$this->batch_running()) return;
+        $total = (int) $b['total']; $done = (int) $b['done'];
+        $pct = $total ? (int) floor($done * 100 / $total) : 0;
+        $bar = '<div style="background:#dcdcde;border-radius:4px;height:' . ($compact ? 8 : 14) . 'px;overflow:hidden;max-width:640px"><div data-mcds="bar" style="background:#2271b1;height:100%;width:' . $pct . '%;transition:width .4s"></div></div>';
+        $current = $b['current'] ? 'Now: ' . $b['current'] : 'Starting…';
+        if ($compact) {
+            echo '<div class="notice notice-info" data-mcds-panel="1" style="padding:10px 14px"><p style="margin:0 0 6px"><span class="spinner is-active" style="float:none;margin:0 6px 0 0;vertical-align:-4px" data-mcds="spinner"></span><strong data-mcds="label">' . esc_html($b['label']) . '</strong> · <span data-mcds="count">' . $done . ' of ' . $total . '</span> · <span data-mcds="errors">' . (int) $b['errors'] . '</span> error(s). ';
+            echo '<span data-mcds="note">You can keep working: this continues in the background, even if you leave this page.</span> <a href="' . esc_url($this->settings_url('changes')) . '">View progress</a></p>' . $bar . '</div>';
             return;
         }
-        if (!empty($b['finished'])) {
-            $d = $this->dest($b['dest'] ?? 'gdocs');
-            $msg = sprintf('Last run (%s): %d of %d %s synced', $d ? $d->label() : '', (int) $b['done'] - (int) $b['errors'], (int) $b['total'], self::type_label($b['type']));
-            $msg .= (int) $b['errors'] ? sprintf(', %d error(s). The DocSync column in %s shows which ones and why.', (int) $b['errors'], ucfirst(self::type_label($b['type']))) : '.';
-            if (!empty($b['cancelled'])) $msg .= ' (Cancelled.)';
-            if (!empty($b['stopped'])) {
-                echo '<div class="notice notice-error inline"><p><strong>Sync all stopped:</strong> the first ' . (int) $b['done'] . ' items all failed with the same error, so the rest were not attempted. Fix this, then run it again:</p><p><code>' . esc_html($b['stopped']) . '</code></p>';
-                if (($b['dest'] ?? '') === 'git') echo '<p>Use <a href="' . esc_url($this->settings_url('git')) . '">Git → Test connection</a> to check the fix before re-running.</p>';
-                echo '</div>';
-            } else {
-                echo '<div class="notice ' . ((int) $b['errors'] ? 'notice-warning' : 'notice-info') . ' inline"><p>' . esc_html($msg) . ' <small>' . esc_html(wp_date(get_option('date_format') . ' ' . get_option('time_format'), (int) $b['finished'])) . '</small></p></div>';
-            }
-            $this->render_failures($b);
+        echo '<div data-mcds-panel="1" style="background:#fff;border:1px solid #c3c4c7;border-left:4px solid #2271b1;padding:12px 16px;max-width:760px;margin:12px 0">';
+        echo '<p style="margin:0 0 8px;font-size:14px"><span class="spinner is-active" style="float:none;margin:0 6px 0 0;vertical-align:-4px" data-mcds="spinner"></span><strong data-mcds="label">' . esc_html($b['label']) . '</strong></p>';
+        echo $bar;
+        echo '<p style="margin:8px 0 0"><span data-mcds="count">' . $done . ' of ' . $total . '</span> done · <span data-mcds="errors">' . (int) $b['errors'] . '</span> error(s) · <span data-mcds="current" style="color:#50575e">' . esc_html($current) . '</span></p>';
+        echo '<p class="description" data-mcds="note" style="margin:6px 0 0">You don’t have to wait here. It keeps running in the background if you leave this page or close the browser (a little slower), and the result appears in the Activity log. Keeping any admin page open makes it finish faster.</p>';
+        echo '<p data-mcds="lasterr" style="color:#b32d2e;margin:6px 0 0' . (empty($b['failures']) ? ';display:none' : '') . '">Latest error: <span data-mcds="lasterr-text">' . esc_html(empty($b['failures']) ? '' : end($b['failures'])['error']) . '</span></p>';
+        echo '<form method="post" action="' . esc_url(admin_url('admin-post.php')) . '" style="margin-top:8px"><input type="hidden" name="action" value="mascamp_docsync_batch_cancel">';
+        wp_nonce_field('mascamp_docsync_batch_cancel');
+        submit_button('Cancel', 'secondary', 'submit', false);
+        echo '</form></div>';
+        $this->render_failures($b);
+    }
+
+    /** Summary of the last finished job. */
+    public function render_last_job() {
+        $b = $this->batch();
+        if (empty($b['finished']) || empty($b['label'])) return;
+        if (time() - (int) $b['finished'] > DAY_IN_SECONDS) return;
+        $ok = (int) $b['done'] - (int) $b['errors'];
+        if (!empty($b['stopped'])) {
+            echo '<div class="notice notice-error inline"><p><strong>' . esc_html($b['label']) . ' stopped:</strong> the first ' . (int) $b['done'] . ' items all failed with the same error, so the rest were not attempted. Fix this, then run it again:</p><p><code>' . esc_html($b['stopped']) . '</code></p>';
+            if (strpos((string) $b['stopped'], 'token') !== false || ($b['dest'] ?? '') === 'git') echo '<p>Use <a href="' . esc_url($this->settings_url('git')) . '">Git → Test connection</a> to check the fix before re-running.</p>';
+            echo '</div>';
+        } else {
+            $msg = sprintf('Finished: %s — %d of %d done', $b['label'], $ok, (int) $b['total']) . ((int) $b['errors'] ? sprintf(', %d failed', (int) $b['errors']) : '') . (!empty($b['cancelled']) ? ' (cancelled)' : '') . '.';
+            echo '<div class="notice ' . ((int) $b['errors'] ? 'notice-warning' : 'notice-success') . ' inline"><p>' . esc_html($msg) . ' <small>' . esc_html(wp_date(get_option('date_format') . ' ' . get_option('time_format'), (int) $b['finished'])) . '</small></p></div>';
         }
+        $this->render_failures($b);
+    }
+
+    private function render_batch_section() {
+        if ($this->batch_running()) { $this->render_progress(); return; }
+        $this->render_last_job();
         $ready = $this->ready_dests();
         if (!$ready) {
             echo '<p>Set up <a href="' . esc_url($this->settings_url('gdocs')) . '">Google Docs</a> or <a href="' . esc_url($this->settings_url('git')) . '">Git</a> first.</p>';
             return;
         }
-        echo '<p>Sync every published post or page in one go. It runs in the background, one item at a time, paced to stay within rate limits.</p>';
+        echo '<p>Sync every published post or page in one go. It runs in the background, one item at a time, with a progress bar. You can leave the page while it runs.</p>';
         foreach ($ready as $id => $d) {
             echo '<h2>' . esc_html($d->label()) . '</h2><table class="widefat striped" style="max-width:760px"><tbody>';
             foreach (self::TYPES as $type) {
@@ -452,7 +496,7 @@ final class Module {
         echo '<p class="description">Google Docs: existing linked docs are overwritten with the current WordPress version (earlier versions stay in each doc\'s Version history). Git: one commit per changed post; unchanged posts are skipped.</p>';
     }
 
-    /** Table of failed items from the current/last Sync all, grouped by error message. */
+    /** Table of failed items from the current/last job, grouped by error message. */
     private function render_failures($b) {
         $fails = (array) ($b['failures'] ?? []);
         if (!$fails) return;
@@ -462,7 +506,7 @@ final class Module {
         foreach ($groups as $error => $items) {
             echo '<div style="background:#fff;border-left:4px solid #d63638;padding:8px 12px;margin:8px 0"><p style="margin:0 0 6px"><strong>' . esc_html($error) . '</strong> <small>(' . count($items) . ' item' . (count($items) === 1 ? '' : 's') . ')</small></p><p style="margin:0;font-size:12px">';
             $links = [];
-            foreach (array_slice($items, 0, 25) as $f) $links[] = '<a href="' . esc_url(get_edit_post_link($f['id'], 'url')) . '">' . esc_html($f['title']) . '</a>';
+            foreach (array_slice($items, 0, 25) as $f) $links[] = $f['id'] ? '<a href="' . esc_url(get_edit_post_link($f['id'], 'url')) . '">' . esc_html($f['title']) . '</a>' : esc_html($f['title']);
             echo implode(' · ', $links) . (count($items) > 25 ? ' · and ' . (count($items) - 25) . ' more' : '');
             echo '</p></div>';
         }
@@ -477,17 +521,13 @@ final class Module {
         $d = $this->dest($dest);
         if (!in_array($type, self::TYPES, true) || !$d) wp_die('Invalid request.');
         $back = $this->settings_url('all');
-        if ($this->batch_running()) { $this->notice('error', 'A Sync all is already running. Wait for it to finish or cancel it first.'); wp_safe_redirect($back); exit; }
+        if ($this->batch_running()) { $this->notice('error', 'Another DocSync job is already running. Wait for it to finish or cancel it first.'); wp_safe_redirect($back); exit; }
         $args = ['post_type' => $type, 'post_status' => 'publish', 'fields' => 'ids', 'posts_per_page' => -1, 'no_found_rows' => true, 'orderby' => 'date', 'order' => 'DESC'];
         if (!empty($_POST['only_new'])) { $args['meta_key'] = $d->keys()['link']; $args['meta_compare'] = 'NOT EXISTS'; }
         $ids = array_map('absint', get_posts($args));
         if (!$ids) { $this->notice('success', 'Nothing to sync: no matching published ' . self::type_label($type) . '.'); wp_safe_redirect($back); exit; }
-        foreach ($ids as $id) { $d->set_meta($id, 'status', 'Queued'); $d->del_meta($id, 'error'); }
-        update_option(self::BATCH_OPTION, ['dest' => $dest, 'type' => $type, 'ids' => $ids, 'total' => count($ids), 'done' => 0, 'errors' => 0, 'started' => time(), 'pause_until' => 0], false);
-        Log::add('Sync all', sprintf('Sync all %s to %s started (%d items)', self::type_label($type), Log::target($dest), count($ids)), 0, $dest);
-        delete_option(self::BATCH_LOCK);
-        wp_clear_scheduled_hook(self::BATCH_HOOK);
-        wp_schedule_single_event(time() + 30, self::BATCH_HOOK);
+        $steps = array_map(static function ($id) use ($dest) { return ['kind' => 'sync', 'dest' => $dest, 'id' => $id]; }, $ids);
+        $this->start_job(sprintf('Syncing all %s to %s', self::type_label($type), $d->label()), $steps, $dest);
         wp_safe_redirect($back); exit;
     }
 
@@ -495,28 +535,32 @@ final class Module {
         if (!current_user_can('manage_options')) wp_die('Forbidden', 403);
         check_admin_referer('mascamp_docsync_batch_cancel');
         $b = $this->batch();
-        $d = $this->dest($b['dest'] ?? 'gdocs');
-        if ($d) foreach ((array) ($b['ids'] ?? []) as $id) {
-            if ($d->meta($id, 'status') === 'Queued') $d->del_meta($id, 'status');
+        foreach ((array) ($b['items'] ?? []) as $st) {
+            if ($st['kind'] === 'sync' && ($d = $this->dest($st['dest'])) && $d->meta($st['id'], 'status') === 'Queued') $d->del_meta($st['id'], 'status');
         }
         if ($b) {
-            $b['ids'] = []; $b['finished'] = time(); $b['cancelled'] = true; update_option(self::BATCH_OPTION, $b, false);
-            Log::add('Sync all', sprintf('Sync all cancelled after %d of %d items', (int) $b['done'], (int) $b['total']), 0, $b['dest'] ?? '', 'warning');
+            $b['items'] = []; $b['finished'] = time(); $b['cancelled'] = true; update_option(self::BATCH_OPTION, $b, false);
+            Log::add('Sync all', sprintf('%s cancelled after %d of %d', $b['label'] ?? 'Job', (int) $b['done'], (int) $b['total']), 0, $b['dest'] ?? '', 'warning');
         }
         wp_clear_scheduled_hook(self::BATCH_HOOK);
         delete_option(self::BATCH_LOCK);
-        $this->notice('success', 'Sync all cancelled.');
-        wp_safe_redirect($this->settings_url('all')); exit;
+        $this->notice('success', 'Cancelled.');
+        wp_safe_redirect(wp_get_referer() ?: $this->settings_url('changes')); exit;
     }
 
-    /** Browser-driven step: one item per request while the Sync all page is open. */
+    /** Browser-driven step: one item per request while any admin page is open. Also returns progress for the UI. */
     public function batch_ajax_step() {
         if (!current_user_can('manage_options')) wp_send_json_error('forbidden', 403);
         check_ajax_referer('mascamp_docsync_batch_step');
+        if (function_exists('ignore_user_abort')) ignore_user_abort(true);
         $wait = $this->batch_process(1, 50);
         $b = $this->batch();
         $last = empty($b['failures']) ? '' : end($b['failures'])['error'];
-        wp_send_json_success(['done' => (int) ($b['done'] ?? 0), 'total' => (int) ($b['total'] ?? 0), 'errors' => (int) ($b['errors'] ?? 0), 'finished' => !$this->batch_running(), 'wait' => $wait, 'last_error' => $last]);
+        wp_send_json_success([
+            'label' => (string) ($b['label'] ?? ''), 'done' => (int) ($b['done'] ?? 0), 'total' => (int) ($b['total'] ?? 0),
+            'errors' => (int) ($b['errors'] ?? 0), 'finished' => !$this->batch_running(), 'wait' => $wait, 'last_error' => $last,
+            'current' => (string) ($b['current'] ?? ''), 'stopped' => (string) ($b['stopped'] ?? ''),
+        ]);
     }
 
     /** Background step via WP-Cron: a few items, then reschedule itself. */
@@ -525,9 +569,15 @@ final class Module {
         if ($this->batch_running() && !wp_next_scheduled(self::BATCH_HOOK)) wp_schedule_single_event(time() + max(20, $wait), self::BATCH_HOOK);
     }
 
+    private function step_label(array $st) {
+        if ($st['kind'] === 'scan') return 'Checking ' . ($st['dest'] === 'git' ? 'Git repository' : 'Google Drive') . ' for changes…';
+        $d = $this->dest($st['dest']);
+        return '“' . self::plain_title($st['id']) . '” → ' . ($d ? $d->label() : $st['dest']);
+    }
+
     /**
-     * Processes up to $max items within ~$seconds. Returns seconds to wait (rate-limit pause), or 0.
-     * A lock prevents the browser loop and WP-Cron from syncing at the same time.
+     * Processes up to $max steps within ~$seconds. Returns seconds to wait (rate-limit pause), or 0.
+     * A lock prevents the browser loop and WP-Cron from running the same job at once.
      */
     private function batch_process($max, $seconds) {
         if (!$this->batch_running()) return 0;
@@ -538,34 +588,41 @@ final class Module {
         delete_option(self::BATCH_LOCK);
         if (!add_option(self::BATCH_LOCK, time(), '', false)) return 0;
 
-        // Queue emptied but never marked finished (e.g. the last sync crashed): close it out.
+        // Queue emptied but never marked finished (e.g. the last step crashed): close it out.
         $b = $this->batch();
-        if (empty($b['ids'])) {
-            $b['finished'] = time();
+        if (empty($b['items'])) {
+            $b['finished'] = time(); $b['current'] = '';
             update_option(self::BATCH_OPTION, $b, false);
             delete_option(self::BATCH_LOCK);
             return 0;
         }
 
-        $dest = $b['dest'] ?? 'gdocs';
-        $d = $this->dest($dest);
         if (function_exists('set_time_limit')) @set_time_limit(300);
+        if (function_exists('ignore_user_abort')) ignore_user_abort(true);
         $start = time(); $n = 0; $wait = 0;
-        while ($d && $n < $max && (time() - $start) < $seconds) {
+        while ($n < $max && (time() - $start) < $seconds) {
             $b = $this->batch();
-            if (empty($b['ids']) || !empty($b['cancelled'])) break;
-            // Remove the item from the queue before syncing, so a crash can't retry it forever.
-            $id = (int) array_shift($b['ids']);
+            if (empty($b['items']) || !empty($b['cancelled'])) break;
+            // Take the step off the queue before running it, so a crash can't retry it forever.
+            $st = array_shift($b['items']);
+            $b['current'] = $this->step_label($st);
             update_option(self::BATCH_OPTION, $b, false);
-            $result = $this->run($dest, $id);
+
+            if ($st['kind'] === 'scan') {
+                $found = $this->monitor->scan_dest($st['dest']);
+                $result = is_wp_error($found) ? $found : true;
+            } else {
+                $result = $this->run($st['dest'], (int) $st['id']);
+            }
+
             $b = $this->batch(); // re-read: picks up a cancel made meanwhile
             if (!empty($b['cancelled'])) break;
             if (is_wp_error($result) && Destination::http_status($result) === 429) {
                 // Rate limit: put it back and pause a minute.
-                array_push($b['ids'], $id);
-                $d->set_meta($id, 'status', 'Queued');
-                $d->del_meta($id, 'error');
+                array_push($b['items'], $st);
+                if ($st['kind'] === 'sync' && ($d = $this->dest($st['dest']))) { $d->set_meta($st['id'], 'status', 'Queued'); $d->del_meta($st['id'], 'error'); }
                 $b['pause_until'] = time() + 65;
+                $b['current'] = 'Rate limit reached: pausing for a minute, then continuing automatically.';
                 update_option(self::BATCH_OPTION, $b, false);
                 $wait = 65;
                 break;
@@ -574,21 +631,24 @@ final class Module {
             if ($result !== true) {
                 $b['errors'] = (int) $b['errors'] + 1;
                 $b['failures'] = array_slice(array_merge((array) ($b['failures'] ?? []), [[
-                    'id' => $id, 'title' => self::plain_title($id),
+                    'id' => $st['kind'] === 'sync' ? (int) $st['id'] : 0,
+                    'title' => $st['kind'] === 'sync' ? self::plain_title($st['id']) : $this->step_label($st),
                     'error' => is_wp_error($result) ? $result->get_error_message() : 'Unknown error',
                 ]]), -100);
                 // The first few all failed the same way: it's a setup problem, so stop instead of failing every post.
                 $msgs = array_unique(array_column($b['failures'], 'error'));
                 if ((int) $b['done'] >= 3 && (int) $b['errors'] === (int) $b['done'] && count($msgs) === 1) {
                     $b['stopped'] = reset($msgs);
-                    foreach ((array) $b['ids'] as $rest) if ($d->meta($rest, 'status') === 'Queued') $d->del_meta($rest, 'status');
-                    $b['ids'] = [];
+                    foreach ((array) $b['items'] as $rest) {
+                        if ($rest['kind'] === 'sync' && ($d = $this->dest($rest['dest'])) && $d->meta($rest['id'], 'status') === 'Queued') $d->del_meta($rest['id'], 'status');
+                    }
+                    $b['items'] = [];
                 }
             }
-            if (empty($b['ids'])) {
-                $b['finished'] = time();
-                if (!empty($b['stopped'])) Log::add('Sync all', sprintf('Sync all stopped: the first %d items failed with the same error', (int) $b['done']), 0, $dest, 'error', $b['stopped']);
-                else Log::add('Sync all', sprintf('Sync all %s to %s complete: %d synced, %d failed', self::type_label($b['type']), Log::target($dest), (int) $b['done'] - (int) $b['errors'], (int) $b['errors']), 0, $dest, $b['errors'] ? 'warning' : 'success');
+            if (empty($b['items'])) {
+                $b['finished'] = time(); $b['current'] = '';
+                if (!empty($b['stopped'])) Log::add('Sync all', sprintf('%s stopped: the first %d items failed with the same error', $b['label'], (int) $b['done']), 0, $b['dest'] ?? '', 'error', $b['stopped']);
+                else Log::add('Sync all', sprintf('%s complete: %d done, %d failed', $b['label'], (int) $b['done'] - (int) $b['errors'], (int) $b['errors']), 0, $b['dest'] ?? '', $b['errors'] ? 'warning' : 'success');
             }
             update_option(self::BATCH_OPTION, $b, false);
             $n++;
@@ -597,11 +657,88 @@ final class Module {
         return $wait;
     }
 
+    /** While a job runs: compact progress notice on other admin pages. */
+    public function job_notice() {
+        if (!current_user_can('manage_options') || !$this->batch_running()) return;
+        $page = $_GET['page'] ?? ''; $tab = $_GET['tab'] ?? 'gdocs';
+        if ($page === self::PAGE && in_array($tab, ['changes', 'all'], true)) return; // full panel is shown there
+        $this->render_progress(true);
+    }
+
+    /** Admin bar indicator so progress is visible from anywhere. */
+    public function admin_bar($bar) {
+        if (!current_user_can('manage_options') || !$this->batch_running()) return;
+        $b = $this->batch();
+        $bar->add_node(['id' => 'mascamp-docsync', 'href' => $this->settings_url('changes'),
+            'title' => '<span class="ab-icon dashicons dashicons-update" style="margin-top:2px"></span><span class="ab-label">DocSync <span data-mcds="count">' . (int) $b['done'] . ' of ' . (int) $b['total'] . '</span></span>',
+            'meta' => ['title' => (string) $b['label']]]);
+    }
+
+    /**
+     * One shared script on every admin page:
+     *  - drives the running job (one step per request) and updates every progress element on the page;
+     *  - shows a "working…" toast for single actions (Sync / Pull / Retry / Scan) so people know what's happening.
+     */
+    public function footer_script() {
+        if (!current_user_can('edit_posts')) return;
+        $running = current_user_can('manage_options') && $this->batch_running();
+        $cfg = ['ajax' => admin_url('admin-ajax.php'), 'nonce' => wp_create_nonce('mascamp_docsync_batch_step'), 'running' => $running,
+            'onDocSync' => ($_GET['page'] ?? '') === self::PAGE, 'changes' => $this->settings_url('changes')];
+        ?>
+<style>
+#mcds-toast{position:fixed;right:20px;bottom:20px;z-index:100000;max-width:380px;background:#1d2327;color:#fff;border-radius:6px;padding:14px 16px;box-shadow:0 6px 24px rgba(0,0,0,.25);font-size:13px;line-height:1.5}
+#mcds-toast strong{display:block;font-size:14px;margin-bottom:2px}
+#mcds-toast .mcds-sp{display:inline-block;width:14px;height:14px;border:2px solid rgba(255,255,255,.35);border-top-color:#fff;border-radius:50%;animation:mcdsspin .8s linear infinite;vertical-align:-2px;margin-right:8px}
+@keyframes mcdsspin{to{transform:rotate(360deg)}}
+</style>
+<script>
+(function(){
+  var C=<?php echo wp_json_encode($cfg); ?>;
+  function each(k,fn){document.querySelectorAll('[data-mcds="'+k+'"]').forEach(fn);}
+  function set(k,v){each(k,function(e){e.textContent=v;});}
+  // ---- single-action toast
+  function toast(title,text){var t=document.getElementById('mcds-toast');if(!t){t=document.createElement('div');t.id='mcds-toast';document.body.appendChild(t);}
+    t.innerHTML='<strong><span class="mcds-sp"></span></strong><span></span>';t.querySelector('strong').appendChild(document.createTextNode(title));t.querySelector('span:last-child').textContent=text;}
+  document.addEventListener('click',function(e){
+    var a=e.target.closest&&e.target.closest('a.mcds-run, button.mcds-run');
+    if(!a||e.defaultPrevented)return;
+    if(a.classList.contains('mcds-confirm')&&!confirm(a.getAttribute('data-confirm'))){e.preventDefault();return;}
+    toast(a.getAttribute('data-mcds-title')||'Working…',a.getAttribute('data-mcds-text')||'This usually takes a few seconds. You can leave this page: it still finishes on the server, and the result appears in the DocSync Activity log.');
+    if(a.tagName==='A'){a.style.pointerEvents='none';a.style.opacity='.6';}
+  });
+  // ---- background job runner + progress
+  if(!C.running)return;
+  var busy=false,fails=0;
+  function step(){
+    if(busy)return;busy=true;
+    var f=new FormData();f.append('action','mascamp_docsync_batch_step');f.append('_ajax_nonce',C.nonce);
+    fetch(C.ajax,{method:'POST',body:f,credentials:'same-origin'}).then(function(r){return r.json();}).then(function(r){
+      busy=false;fails=0;if(!r||!r.success)return setTimeout(step,5000);
+      var d=r.data,pct=d.total?Math.floor(d.done*100/d.total):100;
+      set('count',d.done+' of '+d.total);set('errors',d.errors);if(d.label)set('label',d.label);
+      if(d.current)set('current','Now: '+d.current);
+      each('bar',function(b){b.style.width=pct+'%';});
+      if(d.last_error){each('lasterr',function(e){e.style.display='';});set('lasterr-text',d.last_error);}
+      if(d.finished){
+        each('spinner',function(s){s.classList.remove('is-active');});
+        if(C.onDocSync){location.reload();return;}
+        set('note',d.stopped?'Stopped: '+d.stopped:'Finished: '+(d.done-d.errors)+' done'+(d.errors?', '+d.errors+' failed':'')+'.');
+        set('count',d.done+' of '+d.total);return;
+      }
+      setTimeout(step,d.wait?d.wait*1000:1200);
+    }).catch(function(){busy=false;if(++fails<20)setTimeout(step,5000);});
+  }
+  setTimeout(step,600);
+})();
+</script>
+        <?php
+    }
+
     /* ---------------------------------------------------------------- Notices */
 
     /** Any link with class "mcds-confirm" asks for confirmation using its data-confirm text. */
     public function confirm_script() {
-        echo "<script>document.addEventListener('click',function(e){var a=e.target.closest&&e.target.closest('a.mcds-confirm');if(a&&!confirm(a.getAttribute('data-confirm'))){e.preventDefault();}});</script>";
+        echo "<script>document.addEventListener('click',function(e){var a=e.target.closest&&e.target.closest('a.mcds-confirm');if(a&&!a.classList.contains('mcds-run')&&!confirm(a.getAttribute('data-confirm'))){e.preventDefault();}});</script>";
     }
 
     public function notice($type, $message, $is_html = false) {

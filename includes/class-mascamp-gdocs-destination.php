@@ -278,7 +278,7 @@ final class GDocsDestination extends Destination {
 
         // 1) Replace text and formatting in one atomic batch.
         $req = [];
-        if ($doc_end - 1 > 1) $req[] = ['deleteContent' => ['range' => ['startIndex' => 1, 'endIndex' => $doc_end - 1]]];
+        if ($doc_end - 1 > 1) $req[] = ['deleteContentRange' => ['range' => ['startIndex' => 1, 'endIndex' => $doc_end - 1]]];
         $req[] = ['insertText' => ['location' => ['index' => 1], 'text' => $c['text']]];
         $req[] = ['updateParagraphStyle' => ['range' => ['startIndex' => 1, 'endIndex' => $end], 'paragraphStyle' => ['namedStyleType' => 'NORMAL_TEXT'], 'fields' => 'namedStyleType']];
         $req[] = ['deleteParagraphBullets' => ['range' => ['startIndex' => 1, 'endIndex' => $end]]];
@@ -386,18 +386,19 @@ final class GDocsDestination extends Destination {
         }
         $changed = $this->doc_changed($post->ID);
         if ($changed) echo '<p style="margin:4px 0;color:#996800"><strong>The doc was edited in Google Docs</strong> since the last sync.</p>';
-        echo '<p style="margin:6px 0"><a class="button' . ($changed ? ' button-primary' : '') . ' mcds-confirm" data-confirm="' . esc_attr($this->pull_confirm_text($post->ID)) . '" href="' . esc_url($this->pull_url($post->ID)) . '">Pull from Google Doc</a></p>';
+        echo '<p style="margin:6px 0"><a class="button' . ($changed ? ' button-primary' : '') . ' mcds-confirm mcds-run" data-mcds-title="Pulling from Google Docs…" data-mcds-text="Bringing in the doc’s title, content and images. Usually a few seconds; longer with new images. If you leave, it still finishes on the server." data-confirm="' . esc_attr($this->pull_confirm_text($post->ID)) . '" href="' . esc_url($this->pull_url($post->ID)) . '">Pull from Google Doc</a></p>';
     }
 
     public function row_actions_extra(\WP_Post $post) {
         if (!$this->meta($post->ID, 'link') || Module::is_elementor($post->ID)) return [];
-        return ['mascamp_gdocs_pull' => '<a class="mcds-confirm" data-confirm="' . esc_attr('Replace “' . Module::plain_title($post->ID) . '” with its Google Doc? The current version is saved in Revisions.') . '" href="' . esc_url($this->pull_url($post->ID)) . '">Pull from Google Doc</a>'];
+        return ['mascamp_gdocs_pull' => '<a class="mcds-confirm mcds-run" data-mcds-title="Pulling from Google Docs…" data-confirm=""' . esc_attr('Replace “' . Module::plain_title($post->ID) . '” with its Google Doc? The current version is saved in Revisions.') . '" href="' . esc_url($this->pull_url($post->ID)) . '">Pull from Google Doc</a>'];
     }
 
     public function pull_handler() {
         $post_id = absint($_GET['post'] ?? 0);
         if (!$post_id || !current_user_can('edit_post', $post_id)) wp_die('Forbidden', 403);
         check_admin_referer('mascamp_gdocs_pull_' . $post_id);
+        if (function_exists('ignore_user_abort')) ignore_user_abort(true);
         $r = $this->pull($post_id);
         $title = esc_html(Module::plain_title($post_id));
         if (is_wp_error($r)) {
@@ -625,12 +626,12 @@ final class GDocsDestination extends Destination {
                 $st = get_post_status($pid);
                 echo '<td><a href="' . esc_url(get_edit_post_link($pid, 'url')) . '">' . esc_html(Module::plain_title($pid)) . '</a> <small>(' . esc_html($st === 'publish' ? 'published' : $st) . ')</small></td>';
                 echo '<td style="text-align:right">';
-                if (!Module::is_elementor($pid)) echo '<a class="button mcds-confirm" data-confirm="' . esc_attr($this->pull_confirm_text($pid)) . '" href="' . esc_url($this->pull_url($pid)) . '">Pull latest</a>';
+                if (!Module::is_elementor($pid)) echo '<a class="button mcds-confirm mcds-run" data-mcds-title="Pulling from Google Docs…" data-confirm="' . esc_attr($this->pull_confirm_text($pid)) . '" href="' . esc_url($this->pull_url($pid)) . '">Pull latest</a>';
                 echo '</td></tr>';
             } else {
                 echo '<td><em>Not imported</em></td><td style="text-align:right;white-space:nowrap">';
-                echo '<a class="button button-primary" href="' . esc_url($this->import_url($f['id'], 'post')) . '">Import as draft post</a> ';
-                echo '<a class="button" href="' . esc_url($this->import_url($f['id'], 'page')) . '">as page</a>';
+                echo '<a class="button button-primary mcds-run" data-mcds-title="Importing from Google Docs…" data-mcds-text="Creating a draft and bringing in the doc’s content and images. If you leave, it still finishes on the server." href="' . esc_url($this->import_url($f['id'], 'post')) . '">Import as draft post</a> ';
+                echo '<a class="button mcds-run" data-mcds-title="Importing from Google Docs…" href="' . esc_url($this->import_url($f['id'], 'page')) . '">as page</a>';
                 echo '</td></tr>';
             }
         }
@@ -643,6 +644,7 @@ final class GDocsDestination extends Destination {
         $pto = get_post_type_object($type);
         if (!$doc_id || !$pto || !current_user_can($pto->cap->create_posts)) wp_die('Forbidden', 403);
         check_admin_referer('mascamp_gdocs_import_' . $doc_id);
+        if (function_exists('ignore_user_abort')) ignore_user_abort(true);
         $back = $this->core->settings_url('import');
 
         $exists = get_posts(['post_type' => Module::TYPES, 'post_status' => 'any', 'posts_per_page' => 1, 'fields' => 'ids', 'meta_key' => $this->keys()['link'], 'meta_value' => $doc_id]);

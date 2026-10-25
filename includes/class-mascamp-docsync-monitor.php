@@ -85,32 +85,48 @@ final class Monitor {
     }
 
     /** Full scan: WordPress side + every destination's remote side. */
+    /** Full scan of every destination (hourly cron). */
     public function scan() {
-        if (function_exists('set_time_limit')) @set_time_limit(600);
-        $prev = $this->data()['items'];
-        $items = []; $notes = []; $checked = [];
+        $n = 0;
         foreach (['gdocs', 'git'] as $id) {
-            $d = $this->core->dest($id);
-            if (!$d || !$d->is_ready()) continue;
-            $linked = $this->linked_ids($d);
-            $label = $id === 'git' ? 'Post to Git file scan' : 'Post to Google Doc scan';
-            Log::add('Sync Update', $label . ' started', 0, $id, 'info', sprintf('%d linked items', count($linked)));
-            $remote = $d->scan_remote($linked);
-            if ($remote['note'] !== '') $notes[$id] = $remote['note'];
-            $checked[$id] = count($linked);
-            $ids = array_unique(array_merge($linked, $this->error_ids($d)));
-            $found = 0;
-            foreach ($ids as $pid) {
-                $key = $id . ':' . $pid;
-                $item = $this->build_item($d, $pid, $remote['items'][$pid] ?? null, $prev[$key] ?? null);
-                if (!$item) continue;
-                $items[$key] = $item; $found++;
-                $this->log_new($item, $prev[$key] ?? null);
-            }
-            Log::add('Sync Update', $label . ' complete: ' . ($found ? sprintf(_n('%d item out of sync', '%d items out of sync', $found), $found) : 'everything in sync'), 0, $id, $found ? 'warning' : 'success', $remote['note']);
+            $r = $this->scan_dest($id);
+            if (!is_wp_error($r)) $n += $r;
         }
-        $this->save(['scanned' => time(), 'items' => $items, 'notes' => $notes, 'checked' => $checked]);
-        return count($items);
+        return $n;
+    }
+
+    /**
+     * Scan one destination: WordPress side + its remote copies. Replaces that destination's items.
+     * @return int|\WP_Error number of items out of sync for this destination
+     */
+    public function scan_dest($id) {
+        if (function_exists('set_time_limit')) @set_time_limit(600);
+        $d = $this->core->dest($id);
+        if (!$d) return new \WP_Error('invalid_destination', 'Unknown destination.');
+        $data = $this->data();
+        $prev = $data['items'];
+        foreach (array_keys($data['items']) as $key) if (strpos($key, $id . ':') === 0) unset($data['items'][$key]);
+        unset($data['notes'][$id], $data['checked'][$id]);
+        if (!$d->is_ready()) { $data['scanned'] = time(); $this->save($data); return 0; }
+
+        $linked = $this->linked_ids($d);
+        $label = $id === 'git' ? 'Post to Git file scan' : 'Post to Google Doc scan';
+        Log::add('Sync Update', $label . ' started', 0, $id, 'info', sprintf('%d linked items', count($linked)));
+        $remote = $d->scan_remote($linked);
+        if ($remote['note'] !== '') $data['notes'][$id] = $remote['note'];
+        $data['checked'][$id] = count($linked);
+        $found = 0;
+        foreach (array_unique(array_merge($linked, $this->error_ids($d))) as $pid) {
+            $key = $id . ':' . $pid;
+            $item = $this->build_item($d, $pid, $remote['items'][$pid] ?? null, $prev[$key] ?? null);
+            if (!$item) continue;
+            $data['items'][$key] = $item; $found++;
+            $this->log_new($item, $prev[$key] ?? null);
+        }
+        $data['scanned'] = time();
+        $this->save($data);
+        Log::add('Sync Update', $label . ' complete: ' . ($found ? sprintf(_n('%d item out of sync', '%d items out of sync', $found), $found) : 'everything in sync'), 0, $id, $found ? 'warning' : 'success', $remote['note']);
+        return $found;
     }
 
     /** Re-evaluate one post without remote calls (after a save or a sync). */
@@ -197,24 +213,27 @@ final class Monitor {
         wp_safe_redirect(wp_get_referer() ?: admin_url()); exit;
     }
 
+    /** Scan now: runs in the background with a progress bar (one step per destination). */
     public function scan_handler() {
         if (!current_user_can('manage_options')) wp_die('Forbidden', 403);
         check_admin_referer('mascamp_docsync_scan');
-        $n = $this->scan();
-        $this->core->notice($n ? 'warning' : 'success', $n ? sprintf('Scan complete: %d %s out of sync.', $n, _n('item is', 'items are', $n)) : 'Scan complete: everything is in sync.');
+        $steps = [];
+        foreach (['gdocs', 'git'] as $id) if (($d = $this->core->dest($id)) && $d->is_ready()) $steps[] = ['kind' => 'scan', 'dest' => $id, 'id' => 0];
+        if (!$steps) $this->core->notice('error', 'Set up Google Docs or Git first.');
+        elseif (!$this->core->start_job('Checking Google Drive and Git for changes', $steps)) $this->core->notice('error', 'Another DocSync job is running. The scan can start when it finishes.');
         wp_safe_redirect($this->core->settings_url('changes')); exit;
     }
 
-    /** Queue a push for every item where only WordPress changed (never overwrites remote edits). */
+    /** Push every item where only WordPress changed (never overwrites remote edits), as a background job with progress. */
     public function sync_wp_handler() {
         if (!current_user_can('manage_options')) wp_die('Forbidden', 403);
         check_admin_referer('mascamp_docsync_monitor_sync_wp');
-        $i = 0;
+        $steps = [];
         foreach ($this->data()['items'] as $it) {
-            if ($it['state'] !== 'wp') continue;
-            $this->core->queue($it['dest'], $it['post'], 5 + ($i++ * 8));
+            if ($it['state'] === 'wp' && get_post_status($it['post']) === 'publish') $steps[] = ['kind' => 'sync', 'dest' => $it['dest'], 'id' => (int) $it['post']];
         }
-        $this->core->notice('success', $i ? sprintf('%d %s queued. They’ll sync over the next few minutes; this list updates as each one finishes.', $i, _n('item', 'items', $i)) : 'Nothing to sync.');
+        if (!$steps) $this->core->notice('success', 'Nothing to sync.');
+        elseif (!$this->core->start_job(sprintf('Syncing %d WordPress %s', count($steps), _n('change', 'changes', count($steps))), $steps)) $this->core->notice('error', 'Another DocSync job is running. Try again when it finishes.');
         wp_safe_redirect($this->core->settings_url('changes')); exit;
     }
 
@@ -318,10 +337,13 @@ final class Monitor {
         $data = $this->data();
         $items = $data['items'];
         $scan = wp_nonce_url(admin_url('admin-post.php?action=mascamp_docsync_scan'), 'mascamp_docsync_scan');
+        $running = $this->core->batch_running();
+        if ($running) $this->core->render_progress();
+        else $this->core->render_last_job();
         echo '<h2>Out of sync</h2>';
         echo '<p>Shows posts and pages whose WordPress version and synced copies no longer match: edited in WordPress since the last sync, edited directly in Google Docs or Git, deleted there, or failed to sync. ';
         echo 'WordPress edits are detected instantly; Google Drive and Git are checked hourly.</p>';
-        echo '<p><a class="button" href="' . esc_url($scan) . '">Scan now</a> <span style="color:#646970;margin-left:8px">' . ($data['scanned'] ? 'Last full check: ' . esc_html(self::ago($data['scanned'])) : 'Not scanned yet') . '</span></p>';
+        echo '<p>' . ($running ? '<button class="button" disabled title="Wait for the current job to finish">Scan now</button>' : '<a class="button mcds-run" data-mcds-title="Starting scan…" data-mcds-text="Google Drive and Git are checked in the background with a progress bar. You can leave this page while it runs." href="' . esc_url($scan) . '">Scan now</a>') . ' <span style="color:#646970;margin-left:8px">' . ($data['scanned'] ? 'Last full check: ' . esc_html(self::ago($data['scanned'])) : 'Not scanned yet') . '</span></p>';
         foreach ($data['notes'] as $id => $note) {
             $d = $this->core->dest($id);
             echo '<div class="notice notice-info inline"><p><strong>' . esc_html($d ? $d->label() : $id) . ':</strong> ' . esc_html($note) . '</p></div>';
@@ -353,7 +375,7 @@ final class Monitor {
         echo '</div>';
 
         $wp_only = count(array_filter($items, static function ($it) { return $it['state'] === 'wp'; }));
-        if ($wp_only) {
+        if ($wp_only && !$running) {
             $url = wp_nonce_url(admin_url('admin-post.php?action=mascamp_docsync_monitor_sync_wp'), 'mascamp_docsync_monitor_sync_wp');
             echo '<p><a class="button button-primary mcds-confirm" data-confirm="' . esc_attr('Push ' . $wp_only . ' WordPress change(s) to their Google Docs / Git copies? Items edited on both sides are left for you to decide.') . '" href="' . esc_url($url) . '">Sync all WordPress changes (' . (int) $wp_only . ')</a> <span style="color:#646970">Only items changed in WordPress alone. Anything edited remotely is never overwritten by this button.</span></p>';
         }
@@ -391,28 +413,29 @@ final class Monitor {
             if ($it['state'] === 'both') $what[] = '<em style="color:#b32d2e">Pick one version: the other side’s edits will be replaced' . ($is_docs ? ' (WordPress keeps the old version in Revisions; the doc keeps it in Version history)' : '') . '.</em>';
 
             $actions = [];
+            $run = ' data-mcds-title="' . esc_attr('Working on “' . Module::plain_title($pid) . '”…') . '"';
             $sync = $this->core->sync_url($it['dest'], $pid);
             $published = get_post_status($pid) === 'publish';
             switch ($it['state']) {
                 case 'wp':
-                    $actions[] = '<a class="button button-primary" href="' . esc_url($sync) . '">Sync to ' . esc_html($d->label()) . '</a>';
+                    $actions[] = '<a class="button button-primary mcds-run"' . $run . ' href="' . esc_url($sync) . '">Sync to ' . esc_html($d->label()) . '</a>';
                     break;
                 case 'remote':
                     if ($is_docs && method_exists($d, 'pull_url') && !Module::is_elementor($pid)) {
-                        $actions[] = '<a class="button button-primary mcds-confirm" data-confirm="' . esc_attr('Bring the Google Doc’s changes into “' . Module::plain_title($pid) . '”? The current WordPress version is kept in Revisions.') . '" href="' . esc_url($d->pull_url($pid)) . '">Pull into WordPress</a>';
+                        $actions[] = '<a class="button button-primary mcds-confirm mcds-run"' . $run . ' data-confirm="' . esc_attr('Bring the Google Doc’s changes into “' . Module::plain_title($pid) . '”? The current WordPress version is kept in Revisions.') . '" href="' . esc_url($d->pull_url($pid)) . '">Pull into WordPress</a>';
                     } elseif ($published) {
-                        $actions[] = '<a class="button mcds-confirm" data-confirm="' . esc_attr('Replace the ' . $remote_name . ' with the WordPress version? The change made there will be overwritten' . ($is_docs ? '' : ' (it stays in the repository history)') . '.') . '" href="' . esc_url($this->core->sync_url($it['dest'], $pid, true)) . '">Overwrite with WordPress</a>';
+                        $actions[] = '<a class="button mcds-confirm mcds-run"' . $run . ' data-confirm="' . esc_attr('Replace the ' . $remote_name . ' with the WordPress version? The change made there will be overwritten' . ($is_docs ? '' : ' (it stays in the repository history)') . '.') . '" href="' . esc_url($this->core->sync_url($it['dest'], $pid, true)) . '">Overwrite with WordPress</a>';
                     }
                     break;
                 case 'both':
                     if ($is_docs && method_exists($d, 'pull_url') && !Module::is_elementor($pid)) {
-                        $actions[] = '<a class="button mcds-confirm" data-confirm="' . esc_attr('Keep the Google Doc version? The WordPress edits will be replaced (restorable from Revisions).') . '" href="' . esc_url($d->pull_url($pid)) . '">Keep doc version</a>';
+                        $actions[] = '<a class="button mcds-confirm mcds-run"' . $run . ' data-confirm="' . esc_attr('Keep the Google Doc version? The WordPress edits will be replaced (restorable from Revisions).') . '" href="' . esc_url($d->pull_url($pid)) . '">Keep doc version</a>';
                     }
-                    $actions[] = '<a class="button mcds-confirm" data-confirm="' . esc_attr('Keep the WordPress version? The ' . $remote_name . '’s edits will be overwritten.') . '" href="' . esc_url($this->core->sync_url($it['dest'], $pid, true)) . '">Keep WordPress version</a>';
+                    $actions[] = '<a class="button mcds-confirm mcds-run"' . $run . ' data-confirm="' . esc_attr('Keep the WordPress version? The ' . $remote_name . '’s edits will be overwritten.') . '" href="' . esc_url($this->core->sync_url($it['dest'], $pid, true)) . '">Keep WordPress version</a>';
                     break;
                 case 'missing':
                 case 'error':
-                    if ($published) $actions[] = '<a class="button button-primary" href="' . esc_url($this->core->sync_url($it['dest'], $pid, $it['state'] === 'missing')) . '">' . ($it['state'] === 'missing' ? 'Recreate from WordPress' : 'Retry sync') . '</a>';
+                    if ($published) $actions[] = '<a class="button button-primary mcds-run"' . $run . ' href="' . esc_url($this->core->sync_url($it['dest'], $pid, $it['state'] === 'missing')) . '">' . ($it['state'] === 'missing' ? 'Recreate from WordPress' : 'Retry sync') . '</a>';
                     break;
             }
             $filter = $it['state'] === 'error' ? 'error' : trim((in_array($it['state'], ['wp', 'both'], true) ? 'wp ' : '') . (in_array($it['state'], ['remote', 'both', 'missing'], true) ? $it['dest'] : ''));

@@ -1,8 +1,8 @@
 # MasCamp DocSync
 
-A standalone WordPress plugin that syncs chosen, published posts and pages to **Google Docs** and/or a **Git repository** (GitHub, GitLab, Bitbucket Cloud or Gitea). The sync is one-way: WordPress is the source of truth.
+A standalone WordPress plugin that syncs chosen posts and pages to **Google Docs** and/or a **Git repository** (GitHub, GitLab, Bitbucket Cloud or Gitea). Google Docs is two-way: edits made in a doc can be pulled back into WordPress, and new posts can be written as Google Docs and imported as drafts.
 
-Install it in `wp-content/plugins/mascamp-docsync/` and activate **MasCamp DocSync**. Everything is configured under **Settings → MasCamp DocSync**, which has these tabs: *Google Docs*, *Git*, *Sync all* and *How it works*.
+Install it in `wp-content/plugins/mascamp-docsync/` and activate **MasCamp DocSync**. Everything is configured under **Settings → MasCamp DocSync**, which has these tabs: *Google Docs*, *Git*, *Import from Docs*, *Sync all* and *How it works*.
 
 ## Files
 - `mascamp-docsync.php`: plugin entry point
@@ -10,6 +10,7 @@ Install it in `wp-content/plugins/mascamp-docsync/` and activate **MasCamp DocSy
 - `includes/class-mascamp-docsync-destination.php`: base class shared by the destinations
 - `includes/class-mascamp-gdocs-destination.php`: Google Docs (OAuth, Drive/Docs API)
 - `includes/class-mascamp-gdocs-converter.php`: HTML → Google Docs formatting
+- `includes/class-mascamp-docs-importer.php`: Google Doc → WordPress blocks (used by Pull and Import)
 - `includes/class-mascamp-git-destination.php`: Git settings and the Markdown file builder
 - `includes/class-mascamp-git-client.php`: GitHub, GitLab, Bitbucket and Gitea REST clients
 - `includes/class-mascamp-markdown-converter.php`: HTML → Markdown
@@ -29,9 +30,26 @@ Nothing syncs unless you choose it. Google Docs and Git are chosen separately fo
 3. Create an OAuth client of type **Web application**, and add the redirect URI shown on the *Google Docs* tab.
 4. Enter the Client ID, the Client Secret and the Drive folder (its ID or full URL), save, then click **Connect Google account**.
 
-### Behaviour
-- Each post is linked to one Google Doc. Syncing again replaces that doc's contents: edits made in the doc are overwritten, but they stay in the doc's Version history. If the post's title changes, the doc is renamed. If the doc is deleted or trashed, the next sync creates a new one.
+### WordPress → Doc (push)
+- Each post is linked to one Google Doc. A push replaces that doc's contents with the post. If the post's title changes, the doc is renamed. If the doc is deleted or trashed, the next push creates a new one.
+- **Doc edits are protected:** if the doc was edited in Google Docs since the last sync, a push stops with an error and offers two choices: **Pull the doc into WordPress**, or **Overwrite the doc with WordPress**. Automatic syncs and Sync all never overwrite an edited doc.
 - **Images:** the default *Show images in the doc* embeds each image inside the doc; Google fetches it from its URL. *Link to images only* adds an "Image: …" link to the website URL instead. Neither option adds image files to your Drive folder. If an image can't be fetched (for example WebP, a protected URL or localhost), it becomes a link and a warning is recorded on the post.
+
+### Doc → WordPress (pull)
+- **Pull from Google Doc** is in the post editor's *DocSync* box, in the Posts/Pages row links, and on the *Import from Docs* tab. The editor box shows a notice when the doc has been edited since the last sync.
+- A pull replaces the post's **title** (the doc's *Title*-styled first line), **content** and **images**. The previous version is saved in WordPress **Revisions**, so it can be restored. If the post was also edited in WordPress since the last sync, the confirmation dialog warns you before replacing it.
+- A pull does not change categories, tags, SEO fields, slug, status or the featured image.
+- The header that a push adds to the doc (title, "Source:" line, featured image) is not copied into the post.
+- Content becomes standard WordPress blocks: paragraphs, headings, bulleted and numbered lists (including nested lists), images, tables, bold, italic, underline, strikethrough, links and line breaks. The block markup is checked against the WordPress block validator.
+- **Images:** an image that originally came from your site is matched to its existing Media Library item, so it isn't duplicated. An image pasted straight into the doc is downloaded into the Media Library once; later pulls reuse it (matched by checksum).
+- **Elementor pages are one-way** (WordPress → Doc). Pulling into them is blocked, so their layout is never replaced.
+- A pull doesn't trigger an automatic push back to the doc. Git *Keep synced* still commits the pulled change, as it would for any edit.
+
+### New posts from Google Docs (import)
+1. On the *Google Docs* tab, set an **Import folder**. It can be the same folder as the push folder.
+2. Write a new doc in that folder. A *Title*-styled first line becomes the post title; otherwise the doc's name is used.
+3. On the **Import from Docs** tab, click **Import as draft post** or **as page**. The post is created as a **draft** so you can review it before publishing.
+4. The post stays linked to its doc. To bring in later edits, use **Pull latest** on that tab, or **Pull from Google Doc** on the post.
 
 ## Git
 ### Setup
@@ -62,4 +80,4 @@ define('MASCAMP_DOCSYNC_GIT_TOKEN', 'your-token');
 - Only published posts and pages sync, and each sync copies the last *saved* version.
 - Automatic, bulk and background syncs use WP-Cron, which needs site traffic or a real server cron calling `wp-cron.php`.
 - Google OAuth tokens and the Git token, unless it's defined in wp-config.php, are stored in the WordPress options table.
-- Sync is one-way. Changes made in Google Docs or in the repository never come back into WordPress, and they are overwritten on the next sync.
+- Git is one-way: changes made in the repository never come back into WordPress, and they are overwritten on the next sync. Google Docs is two-way, but only when you pull: nothing is pulled into WordPress automatically.

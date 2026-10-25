@@ -19,6 +19,8 @@ final class Module {
     const BATCH_LOCK   = 'mascamp_docsync_batch_lock';
 
     private static $instance;
+    /** @var array<string,bool> destinations whose automatic push is suppressed (e.g. while pulling from them) */
+    public static $suppress = [];
     /** @var Destination[] */
     private $dests = [];
 
@@ -37,6 +39,7 @@ final class Module {
         add_action(self::ITEM_HOOK, [$this, 'cron_item'], 10, 2);
         add_action(self::LEGACY_HOOK, [$this, 'cron_legacy'], 10, 1);
         add_action('admin_notices', [$this, 'notices']);
+        add_action('admin_footer', [$this, 'confirm_script']);
         add_action('admin_post_mascamp_docsync_batch_start', [$this, 'batch_start']);
         add_action('admin_post_mascamp_docsync_batch_cancel', [$this, 'batch_cancel']);
         add_action('wp_ajax_mascamp_docsync_batch_step', [$this, 'batch_ajax_step']);
@@ -70,11 +73,14 @@ final class Module {
 
     public function settings_page() {
         if (!current_user_can('manage_options')) return;
-        $tabs = ['gdocs' => 'Google Docs', 'git' => 'Git', 'all' => 'Sync all', 'help' => 'How it works'];
+        $tabs = ['gdocs' => 'Google Docs', 'git' => 'Git'];
+        $extra = [];
+        foreach ($this->dests as $d) foreach ($d->tabs() as $slug => $label) { $tabs[$slug] = $label; $extra[$slug] = $d; }
+        $tabs += ['all' => 'Sync all', 'help' => 'How it works'];
         $tab = sanitize_key($_GET['tab'] ?? 'gdocs');
         if (!isset($tabs[$tab])) $tab = 'gdocs';
         echo '<div class="wrap"><h1>MasCamp DocSync</h1>';
-        echo '<p>Sync chosen WordPress posts and pages to Google Docs and/or a Git repository. One-way: WordPress is the source of truth.</p>';
+        echo '<p>Sync chosen WordPress posts and pages to Google Docs and/or a Git repository, and pull Google Doc edits back into WordPress.</p>';
         echo '<nav class="nav-tab-wrapper" style="margin-bottom:16px">';
         foreach ($tabs as $k => $label) {
             $dot = '';
@@ -83,6 +89,7 @@ final class Module {
         }
         echo '</nav>';
         if (isset($this->dests[$tab])) $this->dests[$tab]->render_settings();
+        elseif (isset($extra[$tab])) $extra[$tab]->render_tab($tab);
         elseif ($tab === 'all') $this->render_batch_section();
         else $this->render_help();
         echo '</div>';
@@ -95,7 +102,11 @@ final class Module {
         echo '<li><strong>Several posts:</strong> tick them in Posts/Pages, pick a sync from Bulk actions, and click Apply.</li>';
         echo '<li><strong>Keep a post updated:</strong> tick <em>Keep synced</em> under Google Docs or Git in its DocSync box, or use the matching <em>keep synced</em> bulk action.</li>';
         echo '<li>Only published posts and pages sync. The sync copies the last <em>saved</em> version.</li></ul>';
-        echo '<h2>Google Docs</h2><p>Each post gets one Google Doc in your Drive folder. Syncing again replaces that doc\'s contents, so edits made in the doc are overwritten (they remain in the doc\'s Version history).</p>';
+        echo '<h2>Google Docs (two-way)</h2><p>Each post gets one Google Doc in your Drive folder.</p><ul style="list-style:disc;padding-left:20px">';
+        echo '<li><strong>WordPress → Doc:</strong> <em>Sync to Google Docs</em> replaces the doc\'s contents with the post. If the doc was edited since the last sync, the plugin refuses and offers to <em>Pull</em> first or overwrite the doc, so doc edits are never lost silently.</li>';
+        echo '<li><strong>Doc → WordPress:</strong> <em>Pull from Google Doc</em> (editor box, Posts/Pages row link, or Import from Docs tab) replaces the post\'s title, content and images with the doc. The previous version is kept in WordPress <strong>Revisions</strong>. The editor box tells you when the doc has been edited.</li>';
+        echo '<li><strong>New posts from Docs:</strong> write in your import folder, then use the <a href="' . esc_url($this->settings_url('import')) . '">Import from Docs</a> tab to create draft posts or pages.</li>';
+        echo '<li><strong>Elementor pages</strong> are one-way (WordPress → Doc) so their layout is never replaced.</li></ul>';
         echo '<h2>Git</h2><p>Each post is saved as a Markdown file with its details (title, date, link, categories, tags) at the top. Each change becomes one commit; if nothing changed, no commit is made. Images are referenced by their website URL and are never copied into the repository.</p>';
     }
 
@@ -105,8 +116,8 @@ final class Module {
         foreach (self::TYPES as $type) add_meta_box('mascamp-docsync', 'DocSync', [$this, 'metabox'], $type, 'side', 'high');
     }
 
-    public function sync_url($dest, $post_id) {
-        return wp_nonce_url(admin_url('admin-post.php?action=mascamp_docsync_now&dest=' . rawurlencode($dest) . '&post=' . absint($post_id)), 'mascamp_docsync_now_' . $dest . '_' . absint($post_id));
+    public function sync_url($dest, $post_id, $force = false) {
+        return wp_nonce_url(admin_url('admin-post.php?action=mascamp_docsync_now&dest=' . rawurlencode($dest) . '&post=' . absint($post_id) . ($force ? '&force=1' : '')), 'mascamp_docsync_now_' . $dest . '_' . absint($post_id));
     }
 
     public function metabox($post) {
@@ -135,6 +146,7 @@ final class Module {
                 echo '</ul></details>';
             }
             if ($published) echo '<p style="margin:6px 0"><a class="button" href="' . esc_url($this->sync_url($id, $post->ID)) . '">Sync to ' . esc_html($d->label()) . ' now</a></p>';
+            $d->metabox_extra($post);
             echo '<input type="hidden" name="mascamp_docsync_auto_present[' . esc_attr($id) . ']" value="1">';
             echo '<p style="margin:4px 0"><label><input type="checkbox" name="mascamp_docsync_auto[' . esc_attr($id) . ']" value="1" ' . checked($d->meta($post->ID, 'auto'), '1', false) . '> Keep synced</label>';
             if (!$d->auto_enabled()) echo '<br><small>Automatic sync is paused in settings.</small>';
@@ -178,6 +190,7 @@ final class Module {
         if (!in_array($post->post_type, self::TYPES, true) || $post->post_status !== 'publish' || !current_user_can('edit_post', $post->ID)) return $actions;
         foreach ($this->ready_dests() as $id => $d) {
             $actions['mascamp_docsync_' . $id] = '<a href="' . esc_url($this->sync_url($id, $post->ID)) . '">Sync to ' . esc_html($d->label()) . '</a>';
+            $actions += $d->row_actions_extra($post);
         }
         return $actions;
     }
@@ -219,7 +232,9 @@ final class Module {
         $d = $this->dest($dest);
         if (!$d || !$post_id || !current_user_can('edit_post', $post_id)) wp_die('Forbidden', 403);
         check_admin_referer('mascamp_docsync_now_' . $dest . '_' . $post_id);
+        $d->set_force(!empty($_GET['force']));
         $result = $this->run($dest, $post_id);
+        $d->set_force(false);
         $title = esc_html(self::plain_title($post_id));
         if ($result === true) {
             $status = $d->meta($post_id, 'status');
@@ -230,7 +245,14 @@ final class Module {
             else $msg = '“' . $title . '” synced to ' . esc_html($d->label()) . ($warns ? ' with ' . count($warns) . ' warning(s). See the DocSync box on the post.' : '.');
             $this->notice($warns ? 'warning' : 'success', $msg . $link, true);
         } else {
-            $this->notice('error', esc_html($d->label()) . ' sync failed for “' . $title . '”: ' . esc_html(is_wp_error($result) ? $result->get_error_message() : 'unknown error'), true);
+            $msg = esc_html($d->label()) . ' sync failed for “' . $title . '”: ' . esc_html(is_wp_error($result) ? $result->get_error_message() : 'unknown error');
+            if (is_wp_error($result) && $result->get_error_code() === 'doc_edited') {
+                $msg .= '<br>' . implode(' · ', array_filter([
+                    method_exists($d, 'pull_url') ? '<a href="' . esc_url($d->pull_url($post_id)) . '"><strong>Pull the doc into WordPress</strong></a>' : '',
+                    '<a class="mcds-confirm" data-confirm="' . esc_attr('Replace the Google Doc with the WordPress version? Edits made in the doc will be overwritten (they stay in the doc’s Version history).') . '" href="' . esc_url($this->sync_url($dest, $post_id, true)) . '">Overwrite the doc with WordPress</a>',
+                ]));
+            }
+            $this->notice('error', $msg, true);
         }
         wp_safe_redirect(wp_get_referer() ?: get_edit_post_link($post_id, 'url')); exit;
     }
@@ -239,6 +261,7 @@ final class Module {
         if (wp_is_post_revision($post_id) || (defined('DOING_AUTOSAVE') && DOING_AUTOSAVE) || !($post instanceof \WP_Post)) return;
         if (!in_array($post->post_type, self::TYPES, true) || $post->post_status !== 'publish' || !current_user_can('edit_post', $post_id)) return;
         foreach ($this->dests as $id => $d) {
+            if (!empty(self::$suppress[$id])) continue;
             if ($d->auto_enabled() && $d->meta($post_id, 'auto') === '1' && $d->is_ready()) $this->queue($id, $post_id);
         }
     }
@@ -305,7 +328,7 @@ final class Module {
         $GLOBALS['post'] = $post; // some content filters/shortcodes expect the global post
         setup_postdata($post);
         $html = '';
-        if (class_exists('\Elementor\Plugin') && get_post_meta($post_id, '_elementor_edit_mode', true) === 'builder' && isset(\Elementor\Plugin::instance()->frontend)) {
+        if (self::is_elementor($post_id) && isset(\Elementor\Plugin::instance()->frontend)) {
             try {
                 $html = (string) \Elementor\Plugin::instance()->frontend->get_builder_content_for_display($post_id, false);
             } catch (\Throwable $e) {
@@ -317,6 +340,10 @@ final class Module {
         }
         wp_reset_postdata();
         return $html;
+    }
+
+    public static function is_elementor($post_id) {
+        return class_exists('\Elementor\Plugin') && get_post_meta($post_id, '_elementor_edit_mode', true) === 'builder';
     }
 
     /* ---------------------------------------------------------------- Sync all (background batch) */
@@ -527,6 +554,11 @@ final class Module {
 
     /* ---------------------------------------------------------------- Notices */
 
+    /** Any link with class "mcds-confirm" asks for confirmation using its data-confirm text. */
+    public function confirm_script() {
+        echo "<script>document.addEventListener('click',function(e){var a=e.target.closest&&e.target.closest('a.mcds-confirm');if(a&&!confirm(a.getAttribute('data-confirm'))){e.preventDefault();}});</script>";
+    }
+
     public function notice($type, $message, $is_html = false) {
         set_transient('mascamp_gdocs_notice_' . get_current_user_id(), [$type, $message, $is_html], 120);
     }
@@ -537,7 +569,7 @@ final class Module {
         if ($n) {
             delete_transient($key);
             $type = in_array($n[0], ['success', 'warning', 'error'], true) ? $n[0] : 'info';
-            $msg = !empty($n[2]) ? wp_kses($n[1], ['a' => ['href' => [], 'target' => [], 'rel' => []], 'strong' => [], 'em' => [], 'br' => []]) : esc_html($n[1]);
+            $msg = !empty($n[2]) ? wp_kses($n[1], ['a' => ['href' => [], 'target' => [], 'rel' => [], 'class' => [], 'data-confirm' => []], 'strong' => [], 'em' => [], 'br' => []]) : esc_html($n[1]);
             echo '<div class="notice notice-' . esc_attr($type) . ' is-dismissible"><p>' . $msg . '</p></div>';
         }
         if (!empty($_GET['mcds_bulk']) && preg_match('/^([a-z]+):(sync|auto_on|auto_off)$/', sanitize_text_field(wp_unslash($_GET['mcds_bulk'])), $m) && ($d = $this->dest($m[1]))) {

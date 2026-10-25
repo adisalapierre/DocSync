@@ -47,6 +47,16 @@ abstract class Destination {
     /** Register extra hooks (OAuth callbacks, test buttons…). */
     public function hooks() {}
 
+    /** Extra controls in the post editor's DocSync box (e.g. Pull). */
+    public function metabox_extra(\WP_Post $post) {}
+    /** Extra Posts/Pages row links. @return array */
+    public function row_actions_extra(\WP_Post $post) { return []; }
+    /** Extra settings tabs this destination adds: ['slug' => 'Label']. */
+    public function tabs() { return []; }
+    public function render_tab($tab) {}
+    /** Allow overwriting a destination copy that was edited there since the last sync (manual push only). */
+    public function set_force($force) {}
+
     public function is_ready() { return !is_wp_error($this->ready()); }
 
     public function meta($post_id, $key) { return get_post_meta($post_id, $this->keys()[$key], true); }
